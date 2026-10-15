@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2e35"/>
+      <stop offset="1" stop-color="#121417"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffc25c"/>
+      <stop offset="1" stop-color="#ffa521"/>
+    </linearGradient>
+    <linearGradient id="left" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f39200"/>
+      <stop offset="1" stop-color="#d97f00"/>
+    </linearGradient>
+    <linearGradient id="right" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b86a00"/>
+      <stop offset="1" stop-color="#8f5200"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#bg)"/>
+  <rect x="16.5" y="16.5" width="479" height="479" rx="107.5" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+  <polygon points="256,92 398,174 256,256 114,174" fill="url(#top)"/>
+  <polygon points="114,174 256,256 256,420 114,338" fill="url(#left)"/>
+  <polygon points="256,256 398,174 398,338 256,420" fill="url(#right)"/>
+  <g stroke="#000000" stroke-opacity="0.18" stroke-width="5" stroke-linecap="round">
+    <line x1="114" y1="215" x2="256" y2="297"/>
+    <line x1="114" y1="256" x2="256" y2="338"/>
+    <line x1="114" y1="297" x2="256" y2="379"/>
+    <line x1="256" y1="297" x2="398" y2="215"/>
+    <line x1="256" y1="338" x2="398" y2="256"/>
+    <line x1="256" y1="379" x2="398" y2="297"/>
+  </g>
+  <polyline points="114,174 256,256 398,174" fill="none" stroke="#fff3df" stroke-opacity="0.55" stroke-width="4" stroke-linejoin="round"/>
+  <line x1="256" y1="256" x2="256" y2="420" stroke="#fff3df" stroke-opacity="0.25" stroke-width="4"/>
+</svg>
