@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { AiProvider, ChatAttachments, ChatMessage, OpenRouterModel, Settings } from '@shared/types'
+import type { AiProvider, ChatAttachments, ClaudeEffort, ChatMessage, OpenRouterModel, Settings } from '@shared/types'
 import { readImageFile } from '../lib/images'
+import { AiActivityState, AiStatusCard } from './AiActivity'
 
 interface Props {
   messages: ChatMessage[]
   busy: boolean
+  activity: AiActivityState
   settings: Settings
   attachments: ChatAttachments
   onAttachmentsChange(attachments: ChatAttachments): void
@@ -16,13 +18,23 @@ interface Props {
 }
 
 const CLAUDE_MODELS = [
-  { id: '', label: 'Default' },
+  { id: '', label: 'Default model' },
+  { id: 'fable', label: 'Fable' },
   { id: 'opus', label: 'Opus' },
   { id: 'sonnet', label: 'Sonnet' },
   { id: 'haiku', label: 'Haiku' }
 ]
 
-export function ChatPanel({ messages, busy, settings, attachments, onAttachmentsChange, onSend, onStop, onClear, onSettings, onOpenSettings }: Props) {
+const CLAUDE_EFFORTS: { id: ClaudeEffort; label: string }[] = [
+  { id: '', label: 'Default effort' },
+  { id: 'low', label: 'Low effort' },
+  { id: 'medium', label: 'Medium effort' },
+  { id: 'high', label: 'High effort' },
+  { id: 'xhigh', label: 'Extra high effort' },
+  { id: 'max', label: 'Max effort' }
+]
+
+export function ChatPanel({ messages, busy, activity, settings, attachments, onAttachmentsChange, onSend, onStop, onClear, onSettings, onOpenSettings }: Props) {
   const [draft, setDraft] = useState('')
   const [models, setModels] = useState<OpenRouterModel[]>([])
   const [modelFilter, setModelFilter] = useState('')
@@ -32,7 +44,7 @@ export function ChatPanel({ messages, busy, settings, attachments, onAttachments
 
   useEffect(() => {
     scroller.current?.scrollTo({ top: scroller.current.scrollHeight })
-  }, [messages, busy])
+  }, [messages, busy, activity.step])
 
   useEffect(() => {
     if (settings.aiProvider !== 'openrouter' || models.length) return
@@ -104,13 +116,26 @@ export function ChatPanel({ messages, busy, settings, attachments, onAttachments
             )}
           </div>
         ) : (
-          <select value={settings.claudeModel} onChange={(event) => onSettings({ claudeModel: event.target.value })}>
-            {CLAUDE_MODELS.map((model) => (
-              <option key={model.id} value={model.id}>
-                {model.label}
-              </option>
-            ))}
-          </select>
+          <>
+            <select title="Claude model" value={settings.claudeModel} onChange={(event) => onSettings({ claudeModel: event.target.value })}>
+              {CLAUDE_MODELS.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.label}
+                </option>
+              ))}
+            </select>
+            <select
+              title="How hard Claude thinks. Higher is slower and costs more, but handles tricky parts better."
+              value={settings.claudeEffort ?? ''}
+              onChange={(event) => onSettings({ claudeEffort: event.target.value as ClaudeEffort })}
+            >
+              {CLAUDE_EFFORTS.map((effort) => (
+                <option key={effort.id} value={effort.id}>
+                  {effort.label}
+                </option>
+              ))}
+            </select>
+          </>
         )}
         <button title="Clear conversation" onClick={onClear} disabled={busy}>
           Clear
@@ -152,7 +177,7 @@ export function ChatPanel({ messages, busy, settings, attachments, onAttachments
           </div>
           )
         })}
-        {busy && <div className="chat-message info thinking">Working...</div>}
+        {busy && <AiStatusCard activity={activity} />}
       </div>
       {needsKey && (
         <div className="chat-notice">

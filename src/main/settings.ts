@@ -33,6 +33,7 @@ const DEFAULTS: Settings = {
   openscadPath: '',
   claudePath: '',
   claudeModel: '',
+  claudeEffort: '',
   claudeAllowBash: false,
   openrouterApiKey: '',
   openrouterModel: 'anthropic/claude-sonnet-5.5',

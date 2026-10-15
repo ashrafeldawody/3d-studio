@@ -74,6 +74,7 @@ export function runClaudeCode(
   ]
   if (sessionId) args.push('--resume', sessionId)
   if (settings.claudeModel) args.push('--model', settings.claudeModel)
+  if (settings.claudeEffort) args.push('--effort', settings.claudeEffort)
   const fullPrompt = imagePaths.length
     ? `${prompt}\n\nImages for this request (read them with your Read tool):\n${imagePaths.map((image) => `- ${image.label}: ${image.path}`).join('\n')}`
     : prompt

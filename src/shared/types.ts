@@ -58,10 +58,13 @@ export interface ProjectState {
 
 export type AiProvider = 'openrouter' | 'claude-code'
 
+export type ClaudeEffort = '' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
 export interface Settings {
   openscadPath: string
   claudePath: string
   claudeModel: string
+  claudeEffort: ClaudeEffort
   claudeAllowBash: boolean
   openrouterApiKey: string
   openrouterModel: string

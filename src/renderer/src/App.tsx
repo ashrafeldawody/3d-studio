@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { bakeOperations, findParameters, findParts } from '@shared/scad'
 import type { ChatAttachments, ChatMessage, HistoryEntry, MeshStats, Operation, ProjectState, RenderMessage, Settings } from '@shared/types'
+import { useAiActivity } from './components/AiActivity'
 import { ChatPanel } from './components/ChatPanel'
 import { CodeEditor } from './components/CodeEditor'
 import { HistoryPanel } from './components/HistoryPanel'
@@ -47,6 +48,7 @@ export function App() {
   const [showSlicer, setShowSlicer] = useState(false)
   const [exportMenu, setExportMenu] = useState(false)
   const [toasts, setToasts] = useState<Toast[]>([])
+  const activity = useAiActivity(messages, busy)
   const viewer = useRef<ModelViewer | null>(null)
   const renderToken = useRef(0)
   const latest = useRef({ code, ops, part })
@@ -477,6 +479,7 @@ export function App() {
             bed={[settings.bedX, settings.bedY]}
             simple={simple}
             busy={busy}
+            activity={activity}
             onViewer={(instance) => (viewer.current = instance)}
             onEditOperation={(operation) => setOps((current) => current.map((op) => (op.id === operation.id ? operation : op)))}
             onDeselect={() => setSelectedOpId(null)}
@@ -505,6 +508,7 @@ export function App() {
           <ChatPanel
             messages={messages}
             busy={busy}
+            activity={activity}
             attachments={attachments}
             onAttachmentsChange={setAttachments}
             settings={settings}

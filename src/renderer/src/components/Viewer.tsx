@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ChatPin, MeshStats, Operation, ViewName } from '@shared/types'
-import { BoxGizmoMode, ModelViewer, PinHit, ViewerMode } from '../lib/viewer'
+import { BoxGizmoMode, ModelViewer, PinHit, SnapKind, ViewerMode } from '../lib/viewer'
+import { AiActivityState, AiViewerOverlay } from './AiActivity'
 import { DrawingLayer, DrawingLayerHandle } from './DrawingLayer'
 import { QuickActions } from './QuickActions'
 
@@ -16,6 +17,7 @@ interface Props {
   onEditOperation(operation: Operation): void
   simple: boolean
   busy: boolean
+  activity: AiActivityState
   onPin(hit: PinHit): number
   onRemovePin(id: number): void
   onQuickAction(prompt: string): void
@@ -40,6 +42,16 @@ const MODE_BUTTONS: { mode: ViewerMode; label: string; title: string }[] = [
   { mode: 'pin', label: 'Pin', title: 'Click the model to drop numbered pins for the AI' },
   { mode: 'draw', label: 'Draw', title: 'Draw on the view to show the AI what you mean' }
 ]
+
+const SNAP_LABELS: Record<SnapKind, string> = {
+  corner: 'Corner',
+  midpoint: 'Edge midpoint',
+  edge: 'Edge',
+  face: 'Face',
+  bed: 'Bed'
+}
+
+const MEASURE_HINT = 'Click two points. Snaps to corners, edge midpoints and edges; two parallel faces also give the gap between them.'
 
 const EDIT_HINTS: Partial<Record<Operation['kind'], string>> = {
   translate: 'Drag the arrows to move the model',
@@ -67,14 +79,13 @@ export function Viewer(props: Props) {
     const instance = new ModelViewer(host.current!)
     viewer.current = instance
     instance.onMeasure = (result) => {
-      if (result.distance !== null) {
-        const [a, b] = result.points
-        setMeasure(
-          `${result.distance.toFixed(2)} mm  (dx ${Math.abs(b.x - a.x).toFixed(2)}, dy ${Math.abs(b.y - a.y).toFixed(2)}, dz ${Math.abs(b.z - a.z).toFixed(2)})`
-        )
+      if (result.distance !== null && result.delta) {
+        const { x, y, z } = result.delta
+        const gap = result.faceGap !== null ? ` · faces ${result.faceGap.toFixed(2)} mm apart` : ''
+        setMeasure(`#${result.count}: ${result.distance.toFixed(2)} mm  (X ${x.toFixed(2)} · Y ${y.toFixed(2)} · Z ${z.toFixed(2)})${gap}`)
       } else {
-        const p = result.points[0]
-        setMeasure(`Point at x ${p.x.toFixed(2)}, y ${p.y.toFixed(2)}, z ${p.z.toFixed(2)}: click a second point`)
+        const { point, snap } = result.points[0]
+        setMeasure(`${SNAP_LABELS[snap]} at ${point.x.toFixed(2)}, ${point.y.toFixed(2)}, ${point.z.toFixed(2)} · click a second point`)
       }
     }
     instance.onPin = (hit) => {
@@ -136,7 +147,12 @@ export function Viewer(props: Props) {
   const changeMode = (next: ViewerMode): void => {
     setMode(next)
     viewer.current?.setMode(next)
-    setMeasure(next === 'measure' ? 'Click two points on the model' : null)
+    setMeasure(next === 'measure' ? MEASURE_HINT : null)
+  }
+
+  const clearMeasurements = (): void => {
+    viewer.current?.clearMeasurements()
+    setMeasure(MEASURE_HINT)
   }
 
   const toggleWireframe = (): void => {
@@ -183,6 +199,12 @@ export function Viewer(props: Props) {
             {button.label}
           </button>
         ))}
+        {mode === 'measure' && (
+          <>
+            <span className="divider" />
+            <button onClick={clearMeasurements}>Clear</button>
+          </>
+        )}
         {mode === 'draw' && (
           <>
             <span className="divider" />
@@ -230,17 +252,22 @@ export function Viewer(props: Props) {
           }}
         />
       )}
-      {props.simple && !stl && !rendering && (
+      {props.simple && !stl && !rendering && !props.busy && (
         <div className="viewer-empty">
           <div>Nothing here yet.</div>
           <div className="muted">Describe what you want in the chat on the right.</div>
         </div>
       )}
-      {props.simple && stl && mode === 'orbit' && !quick && !selected && (
+      {props.simple && stl && mode === 'orbit' && !quick && !selected && !props.busy && (
         <div className="viewer-tip">Click anywhere on the part to change that spot · drag to turn · scroll to zoom</div>
       )}
-      {props.busy && <div className="viewer-badge working">AI is working…</div>}
-      {rendering && !props.busy && <div className="viewer-badge">Rendering...</div>}
+      {props.busy && <AiViewerOverlay activity={props.activity} hasModel={Boolean(stl)} />}
+      {rendering && !props.busy && (
+        <div className="viewer-badge">
+          <span className="render-dot" />
+          Rendering
+        </div>
+      )}
       {measure && <div className="viewer-measure">{measure}</div>}
       {mode === 'pin' && <div className="viewer-measure">Click the model to drop a pin. Add notes to pins in the chat box.</div>}
       {mode === 'draw' && <div className="viewer-measure">Draw on the view, then press "📷 To chat"</div>}

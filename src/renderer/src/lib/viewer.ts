@@ -7,10 +7,31 @@ import type { ChatPin, Operation, Vector3, ViewName } from '@shared/types'
 export type ViewerMode = 'orbit' | 'measure' | 'pin' | 'draw'
 export type BoxGizmoMode = 'translate' | 'scale'
 
-export interface MeasureResult {
-  points: THREE.Vector3[]
-  distance: number | null
+export type SnapKind = 'corner' | 'midpoint' | 'edge' | 'face' | 'bed'
+
+export interface MeasurePoint {
+  point: THREE.Vector3
+  normal: THREE.Vector3 | null
+  snap: SnapKind
 }
+
+export interface MeasureResult {
+  points: MeasurePoint[]
+  distance: number | null
+  delta: THREE.Vector3 | null
+  faceGap: number | null
+  count: number
+}
+
+const SNAP_COLORS: Record<SnapKind, number> = {
+  corner: 0x57ab5a,
+  midpoint: 0xc678dd,
+  edge: 0x539bf5,
+  face: 0xffffff,
+  bed: 0x8b949e
+}
+
+const SNAP_PIXELS = { corner: 12, midpoint: 10, edge: 8 }
 
 export interface PinHit {
   point: Vector3
@@ -38,10 +59,14 @@ export class ModelViewer {
   private mesh: THREE.Mesh | null = null
   private edges: THREE.LineSegments | null = null
   private bed = new THREE.Group()
+  private axes = new THREE.Group()
   private helpers = new THREE.Group()
   private pinsGroup = new THREE.Group()
   private measureGroup = new THREE.Group()
-  private measurePoints: THREE.Vector3[] = []
+  private measurePoints: MeasurePoint[] = []
+  private measureCount = 0
+  private measureHover: THREE.Sprite | null = null
+  private hoverFrame = 0
   private frame = 0
   private resizeObserver: ResizeObserver
   private raycaster = new THREE.Raycaster()
@@ -83,12 +108,14 @@ export class ModelViewer {
     const fill = new THREE.DirectionalLight(0xffffff, 0.6)
     fill.position.set(-1.5, 1, 0.5)
     this.scene.add(fill)
-    this.scene.add(this.bed, this.modelRoot, this.helpers, this.pinsGroup, this.measureGroup)
+    this.scene.add(this.bed, this.axes, this.modelRoot, this.helpers, this.pinsGroup, this.measureGroup)
     this.buildBed()
     this.resizeObserver = new ResizeObserver(() => this.resize())
     this.resizeObserver.observe(container)
     this.renderer.domElement.addEventListener('pointerdown', this.handlePointerDown)
     this.renderer.domElement.addEventListener('pointerup', this.handlePointerUp)
+    this.renderer.domElement.addEventListener('pointermove', this.handlePointerMove)
+    this.renderer.domElement.addEventListener('pointerleave', this.hideMeasureHover)
     this.resize()
     this.loop()
   }
@@ -98,6 +125,9 @@ export class ModelViewer {
     this.resizeObserver.disconnect()
     this.renderer.domElement.removeEventListener('pointerdown', this.handlePointerDown)
     this.renderer.domElement.removeEventListener('pointerup', this.handlePointerUp)
+    this.renderer.domElement.removeEventListener('pointermove', this.handlePointerMove)
+    this.renderer.domElement.removeEventListener('pointerleave', this.hideMeasureHover)
+    cancelAnimationFrame(this.hoverFrame)
     this.gizmo.detach()
     this.gizmo.dispose()
     this.controls.dispose()
@@ -129,7 +159,28 @@ export class ModelViewer {
       const geometry = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(...to)])
       return new THREE.Line(geometry, new THREE.LineBasicMaterial({ color }))
     }
-    this.bed.add(axis([30, 0, 0], 0xe5534b), axis([0, 30, 0], 0x57ab5a), axis([0, 0, 30], 0x539bf5))
+    this.axes.clear()
+    this.axes.add(axis([30, 0, 0], 0xe5534b), axis([0, 30, 0], 0x57ab5a), axis([0, 0, 30], 0x539bf5))
+    this.centerBedUnderModel()
+  }
+
+  private centerBedUnderModel(): void {
+    const [x, y] = this.bedSize
+    if (!this.mesh) {
+      this.bed.position.set(0, 0, 0)
+      return
+    }
+    const center = new THREE.Box3().setFromObject(this.mesh).getCenter(new THREE.Vector3())
+    const snap = (value: number): number => Math.round(value / 10) * 10
+    this.bed.position.set(snap(center.x - x / 2), snap(center.y - y / 2), 0)
+  }
+
+  private needsReframe(previous: THREE.Box3, next: THREE.Box3): boolean {
+    const previousSize = Math.max(previous.getSize(new THREE.Vector3()).length(), 1)
+    const nextSize = Math.max(next.getSize(new THREE.Vector3()).length(), 1)
+    const shift = previous.getCenter(new THREE.Vector3()).distanceTo(next.getCenter(new THREE.Vector3()))
+    const ratio = nextSize / previousSize
+    return ratio > 1.5 || ratio < 1 / 1.5 || shift > Math.max(previousSize, nextSize) * 0.25
   }
 
   private resize(): void {
@@ -152,7 +203,7 @@ export class ModelViewer {
     const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer
     const geometry = new STLLoader().parse(buffer)
     geometry.computeVertexNormals()
-    const firstModel = !this.mesh
+    const previousBounds = this.mesh ? this.bounds() : null
     this.clearModel()
     this.mesh = new THREE.Mesh(
       geometry,
@@ -163,7 +214,8 @@ export class ModelViewer {
     this.modelRoot.position.set(0, 0, 0)
     this.modelRoot.quaternion.identity()
     this.modelRoot.scale.set(1, 1, 1)
-    if (!keepCamera || firstModel) this.setView('iso')
+    this.centerBedUnderModel()
+    if (!keepCamera || !previousBounds || this.needsReframe(previousBounds, this.bounds())) this.setView('iso')
     this.rebuildHelpers()
   }
 
@@ -253,9 +305,15 @@ export class ModelViewer {
     this.controls.enabled = mode !== 'draw'
     this.renderer.domElement.style.cursor = mode === 'measure' || mode === 'pin' ? 'crosshair' : ''
     if (mode !== 'measure') {
-      this.measurePoints = []
-      this.measureGroup.clear()
+      this.clearMeasurements()
+      this.hideMeasureHover()
     }
+  }
+
+  clearMeasurements(): void {
+    this.measurePoints = []
+    this.measureCount = 0
+    disposeChildren(this.measureGroup)
   }
 
   setOperations(ops: Operation[], editId: string | null): void {
@@ -458,29 +516,213 @@ export class ModelViewer {
     }
   }
 
-  private measureClick(event: PointerEvent): void {
-    const hit = this.hitModel(event)
-    if (!hit) return
-    if (this.measurePoints.length >= 2) {
-      this.measurePoints = []
-      this.measureGroup.clear()
+  private handlePointerMove = (event: PointerEvent): void => {
+    if (this.mode !== 'measure' || event.buttons) return
+    cancelAnimationFrame(this.hoverFrame)
+    const { clientX, clientY } = event
+    this.hoverFrame = requestAnimationFrame(() => this.showMeasureHover(this.findMeasurePoint(clientX, clientY)))
+  }
+
+  private hideMeasureHover = (): void => {
+    cancelAnimationFrame(this.hoverFrame)
+    if (this.measureHover) this.measureHover.visible = false
+  }
+
+  private showMeasureHover(target: MeasurePoint | null): void {
+    if (!target) {
+      this.hideMeasureHover()
+      return
     }
-    this.measurePoints.push(hit.point.clone())
-    const size = Math.max(this.bounds().getSize(new THREE.Vector3()).length() / 150, 0.15)
-    const marker = new THREE.Mesh(new THREE.SphereGeometry(size, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }))
-    marker.position.copy(hit.point)
+    if (!this.measureHover) {
+      this.measureHover = new THREE.Sprite(new THREE.SpriteMaterial({ map: snapTexture(), depthTest: false, sizeAttenuation: false }))
+      this.measureHover.scale.set(0.035, 0.035, 1)
+      this.measureHover.renderOrder = 30
+      this.scene.add(this.measureHover)
+    }
+    this.measureHover.visible = true
+    this.measureHover.position.copy(target.point)
+    this.measureHover.material.color.setHex(SNAP_COLORS[target.snap])
+  }
+
+  private screenPoint(point: THREE.Vector3, rect: DOMRect): THREE.Vector2 | null {
+    const projected = point.clone().project(this.camera)
+    if (projected.z > 1 || projected.z < -1) return null
+    return new THREE.Vector2(((projected.x + 1) / 2) * rect.width, ((1 - projected.y) / 2) * rect.height)
+  }
+
+  private isVisible(point: THREE.Vector3): boolean {
+    if (!this.mesh) return true
+    const origin = this.camera.position.clone()
+    const distance = origin.distanceTo(point)
+    this.raycaster.set(origin, point.clone().sub(origin).normalize())
+    const hit = this.raycaster.intersectObject(this.mesh)[0]
+    return !hit || hit.distance >= distance - Math.max(distance * 0.002, 0.05)
+  }
+
+  private snapCandidates(pointer: THREE.Vector2, rect: DOMRect): { point: THREE.Vector3; snap: SnapKind; score: number }[] {
+    if (!this.edges) return []
+    const positions = this.edges.geometry.getAttribute('position')
+    const matrix = this.edges.matrixWorld
+    const candidates: { point: THREE.Vector3; snap: SnapKind; score: number }[] = []
+    const rank: Record<SnapKind, number> = { corner: 0, midpoint: 1000, edge: 2000, face: 3000, bed: 4000 }
+    const a = new THREE.Vector3()
+    const b = new THREE.Vector3()
+    for (let index = 0; index < positions.count; index += 2) {
+      a.fromBufferAttribute(positions, index).applyMatrix4(matrix)
+      b.fromBufferAttribute(positions, index + 1).applyMatrix4(matrix)
+      const sa = this.screenPoint(a, rect)
+      const sb = this.screenPoint(b, rect)
+      if (!sa || !sb) continue
+      for (const [world, screen] of [[a, sa], [b, sb]] as const) {
+        const distance = screen.distanceTo(pointer)
+        if (distance < SNAP_PIXELS.corner) candidates.push({ point: world.clone(), snap: 'corner', score: rank.corner + distance })
+      }
+      const middle = a.clone().add(b).multiplyScalar(0.5)
+      const middleScreen = sa.clone().add(sb).multiplyScalar(0.5)
+      const middleDistance = middleScreen.distanceTo(pointer)
+      if (middleDistance < SNAP_PIXELS.midpoint) candidates.push({ point: middle, snap: 'midpoint', score: rank.midpoint + middleDistance })
+      const segment = sb.clone().sub(sa)
+      const lengthSquared = segment.lengthSq()
+      if (lengthSquared < 1) continue
+      const t = THREE.MathUtils.clamp(pointer.clone().sub(sa).dot(segment) / lengthSquared, 0, 1)
+      const edgeDistance = sa.clone().addScaledVector(segment, t).distanceTo(pointer)
+      if (edgeDistance < SNAP_PIXELS.edge) candidates.push({ point: a.clone().lerp(b, t), snap: 'edge', score: rank.edge + edgeDistance })
+    }
+    return candidates.sort((left, right) => left.score - right.score)
+  }
+
+  private findMeasurePoint(clientX: number, clientY: number): MeasurePoint | null {
+    const rect = this.renderer.domElement.getBoundingClientRect()
+    const pointer = new THREE.Vector2(clientX - rect.left, clientY - rect.top)
+    for (const candidate of this.snapCandidates(pointer, rect).slice(0, 8)) {
+      if (this.isVisible(candidate.point)) return { point: candidate.point, normal: null, snap: candidate.snap }
+    }
+    const ndc = new THREE.Vector2((pointer.x / rect.width) * 2 - 1, -(pointer.y / rect.height) * 2 + 1)
+    this.raycaster.setFromCamera(ndc, this.camera)
+    const hit = this.mesh ? this.raycaster.intersectObject(this.mesh)[0] : undefined
+    if (hit) {
+      const normal = hit.face ? hit.face.normal.clone().transformDirection(this.mesh!.matrixWorld) : null
+      return { point: hit.point.clone(), normal, snap: 'face' }
+    }
+    const bedPoint = this.raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), 0), new THREE.Vector3())
+    return bedPoint ? { point: bedPoint, normal: new THREE.Vector3(0, 0, 1), snap: 'bed' } : null
+  }
+
+  private measureClick(event: PointerEvent): void {
+    const target = this.findMeasurePoint(event.clientX, event.clientY)
+    if (!target) return
+    if (this.measurePoints.length >= 2) this.measurePoints = []
+    this.measurePoints.push(target)
+    const scale = Math.max(this.bounds().getSize(new THREE.Vector3()).length() / 180, 0.12)
+    const marker = new THREE.Mesh(new THREE.SphereGeometry(scale, 16, 12), new THREE.MeshBasicMaterial({ color: SNAP_COLORS[target.snap], depthTest: false }))
+    marker.position.copy(target.point)
     marker.renderOrder = 10
     this.measureGroup.add(marker)
-    if (this.measurePoints.length === 2) {
-      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(this.measurePoints), new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false }))
-      line.renderOrder = 10
-      this.measureGroup.add(line)
+    if (this.measurePoints.length < 2) {
+      this.onMeasure?.({ points: [...this.measurePoints], distance: null, delta: null, faceGap: null, count: this.measureCount })
+      return
     }
+    const [first, second] = this.measurePoints
+    const delta = second.point.clone().sub(first.point)
+    this.measureCount++
+    this.drawMeasurement(first.point, second.point)
     this.onMeasure?.({
       points: [...this.measurePoints],
-      distance: this.measurePoints.length === 2 ? this.measurePoints[0].distanceTo(this.measurePoints[1]) : null
+      distance: delta.length(),
+      delta: new THREE.Vector3(Math.abs(delta.x), Math.abs(delta.y), Math.abs(delta.z)),
+      faceGap: parallelFaceGap(first, second),
+      count: this.measureCount
     })
   }
+
+  private drawMeasurement(start: THREE.Vector3, end: THREE.Vector3): void {
+    const line = (points: THREE.Vector3[], color: number, dashed: boolean): void => {
+      const geometry = new THREE.BufferGeometry().setFromPoints(points)
+      const material = dashed
+        ? new THREE.LineDashedMaterial({ color, depthTest: false, dashSize: 1.2, gapSize: 0.8, transparent: true, opacity: 0.8 })
+        : new THREE.LineBasicMaterial({ color, depthTest: false })
+      const object = new THREE.Line(geometry, material)
+      if (dashed) object.computeLineDistances()
+      object.renderOrder = 10
+      this.measureGroup.add(object)
+    }
+    const corner1 = new THREE.Vector3(end.x, start.y, start.z)
+    const corner2 = new THREE.Vector3(end.x, end.y, start.z)
+    const legs: [THREE.Vector3, THREE.Vector3, number][] = [
+      [start, corner1, 0xe5534b],
+      [corner1, corner2, 0x57ab5a],
+      [corner2, end, 0x539bf5]
+    ]
+    const nonZeroLegs = legs.filter(([from, to]) => from.distanceTo(to) > 0.01)
+    if (nonZeroLegs.length > 1) for (const [from, to, color] of nonZeroLegs) line([from, to], color, true)
+    line([start, end], 0xffffff, false)
+    const label = textSprite(`${this.measureCount}: ${start.distanceTo(end).toFixed(2)} mm`)
+    label.position.copy(start).add(end).multiplyScalar(0.5)
+    this.measureGroup.add(label)
+  }
+}
+
+function parallelFaceGap(first: MeasurePoint, second: MeasurePoint): number | null {
+  if (!first.normal || !second.normal) return null
+  if (Math.abs(first.normal.dot(second.normal)) < 0.9995) return null
+  const gap = Math.abs(second.point.clone().sub(first.point).dot(first.normal))
+  return gap > 0.001 ? gap : null
+}
+
+function disposeChildren(group: THREE.Group): void {
+  for (const child of [...group.children]) {
+    const object = child as THREE.Mesh
+    object.geometry?.dispose()
+    const material = object.material as THREE.Material | undefined
+    if (material && 'map' in material && material.map instanceof THREE.CanvasTexture) material.map.dispose()
+    material?.dispose()
+    group.remove(child)
+  }
+}
+
+let snapTextureCache: THREE.Texture | null = null
+
+function snapTexture(): THREE.Texture {
+  if (snapTextureCache) return snapTextureCache
+  const canvas = document.createElement('canvas')
+  canvas.width = 64
+  canvas.height = 64
+  const context = canvas.getContext('2d')!
+  context.strokeStyle = '#ffffff'
+  context.lineWidth = 6
+  context.beginPath()
+  context.arc(32, 32, 22, 0, Math.PI * 2)
+  context.stroke()
+  context.fillStyle = '#ffffff'
+  context.beginPath()
+  context.arc(32, 32, 6, 0, Math.PI * 2)
+  context.fill()
+  snapTextureCache = new THREE.CanvasTexture(canvas)
+  return snapTextureCache
+}
+
+function textSprite(text: string): THREE.Sprite {
+  const canvas = document.createElement('canvas')
+  const context = canvas.getContext('2d')!
+  const font = 'bold 30px Segoe UI, sans-serif'
+  context.font = font
+  const width = Math.ceil(context.measureText(text).width) + 28
+  canvas.width = width
+  canvas.height = 48
+  context.font = font
+  context.fillStyle = 'rgba(21, 23, 26, 0.88)'
+  context.beginPath()
+  context.roundRect(0, 0, width, 48, 12)
+  context.fill()
+  context.fillStyle = '#ffffff'
+  context.textBaseline = 'middle'
+  context.fillText(text, 14, 25)
+  const texture = new THREE.CanvasTexture(canvas)
+  texture.colorSpace = THREE.SRGBColorSpace
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, depthTest: false, sizeAttenuation: false }))
+  sprite.scale.set((0.032 * width) / 48, 0.032, 1)
+  sprite.renderOrder = 25
+  return sprite
 }
 
 const textureCache = new Map<number, THREE.Texture>()
