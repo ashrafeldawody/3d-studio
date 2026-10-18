@@ -93,6 +93,7 @@ export interface Settings {
   bedZ: number
   printerName: string
   recentProjects: string[]
+  slicerPreferences: Partial<Record<SlicerApp, SlicerPreferences>>
 }
 
 export interface ChatMessage {
@@ -140,6 +141,15 @@ export interface SlicerFilament {
   colour: string
 }
 
+export interface SlicerPreferences {
+  printer: string
+  process: string
+  filaments: SlicerFilament[]
+  colorMap: Record<string, number>
+  infill: string
+  brim: boolean
+}
+
 export interface SlicerObject {
   name: string
   part: string
@@ -155,6 +165,7 @@ export interface SlicerExportRequest {
   process: string
   filaments: SlicerFilament[]
   objects: SlicerObject[]
+  colorMap: Record<string, number>
   settings: Record<string, string>
 }
 

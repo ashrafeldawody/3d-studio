@@ -850,6 +850,9 @@ export function App() {
           projectName={project.name}
           parts={parts}
           currentPart={part}
+          modelColors={[...new Set((model ?? []).map((item) => item.color).filter(Boolean))]}
+          saved={settings.slicerPreferences?.[slicerApp] ?? null}
+          onSavePreferences={(preferences) => updateSettings({ slicerPreferences: { ...settings.slicerPreferences, [slicerApp]: preferences } })}
           onClose={() => setSlicerApp(null)}
           onExport={async (choice) => {
             const outputPath = await window.studio.slicer.chooseOutput(project.name)

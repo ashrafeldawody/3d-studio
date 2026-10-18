@@ -1811,3 +1811,18 @@ button.big {
   color: var(--muted);
   cursor: pointer;
 }
+
+.color-chip {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  flex-shrink: 0;
+}
+
+.color-name {
+  min-width: 90px;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+}

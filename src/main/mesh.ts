@@ -406,19 +406,106 @@ export const RELS_XML =
   '<Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>' +
   '</Relationships>\n'
 
+const NAMED_COLORS: Record<string, string> = {
+  black: '#000000',
+  white: '#ffffff',
+  gray: '#808080',
+  grey: '#808080',
+  silver: '#c0c0c0',
+  red: '#ff0000',
+  darkred: '#8b0000',
+  maroon: '#800000',
+  orange: '#ffa500',
+  yellow: '#ffff00',
+  gold: '#ffd700',
+  green: '#008000',
+  lime: '#00ff00',
+  darkgreen: '#006400',
+  olive: '#808000',
+  teal: '#008080',
+  cyan: '#00ffff',
+  aqua: '#00ffff',
+  blue: '#0000ff',
+  navy: '#000080',
+  skyblue: '#87ceeb',
+  purple: '#800080',
+  violet: '#ee82ee',
+  magenta: '#ff00ff',
+  pink: '#ffc0cb',
+  brown: '#a52a2a',
+  tan: '#d2b48c',
+  beige: '#f5f5dc'
+}
+
+export function colorToHex(color: string | undefined): string | null {
+  const value = (color ?? '').trim().toLowerCase()
+  if (!value) return null
+  const hex = value.match(/^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/)
+  if (hex) {
+    const digits = hex[1].length <= 4 ? [...hex[1].slice(0, 3)].map((digit) => digit + digit).join('') : hex[1].slice(0, 6)
+    return `#${digits}`
+  }
+  const vector = value.match(/^\[([^\]]*)\]$/)
+  if (vector) {
+    const channels = vector[1].split(',').slice(0, 3).map(Number)
+    if (channels.length === 3 && channels.every(Number.isFinite)) {
+      return `#${channels.map((channel) => Math.round(Math.min(1, Math.max(0, channel)) * 255).toString(16).padStart(2, '0')).join('')}`
+    }
+  }
+  return NAMED_COLORS[value] ?? null
+}
+
 export function write3mf(meshes: NamedMesh[], title: string): Uint8Array {
-  const resources: string[] = []
-  const items: string[] = []
+  if (meshes.length === 1) return writeSimple3mf(meshes[0], title)
+  const colors = meshes.map((mesh) => colorToHex(mesh.color) ?? '#909090')
+  const materials = `<basematerials id="1">${meshes.map((mesh, index) => `<base name="${escapeXml(mesh.name)}" displaycolor="${colors[index].toUpperCase()}FF"/>`).join('')}</basematerials>`
+  const resources: string[] = [materials]
+  const components: string[] = []
+  const parts: string[] = []
   meshes.forEach((mesh, index) => {
-    const id = index + 1
-    resources.push(`<object id="${id}" name="${escapeXml(mesh.name)}" type="model">${meshXml(mesh.triangles)}</object>`)
-    items.push(`<item objectid="${id}"/>`)
+    const id = index + 2
+    resources.push(`<object id="${id}" name="${escapeXml(mesh.name)}" type="model" pid="1" pindex="${index}">${meshXml(mesh.triangles)}</object>`)
+    components.push(`<component objectid="${id}"/>`)
+    parts.push(
+      [
+        `    <part id="${id}" subtype="normal_part">`,
+        `      <metadata key="name" value="${escapeXml(mesh.name)}"/>`,
+        `      <metadata key="extruder" value="${index + 1}"/>`,
+        '    </part>'
+      ].join('\n')
+    )
   })
+  const objectId = meshes.length + 2
+  resources.push(`<object id="${objectId}" name="${escapeXml(title)}" type="model"><components>${components.join('')}</components></object>`)
+  const model =
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" ' +
+    'xmlns:BambuStudio="http://schemas.bambulab.com/package/2021">\n' +
+    '<metadata name="Application">BambuStudio-01.10.00.00</metadata>\n' +
+    '<metadata name="BambuStudio:3mfVersion">1</metadata>\n' +
+    `<metadata name="Title">${escapeXml(title)}</metadata>\n` +
+    `<resources>\n${resources.join('\n')}\n</resources>\n<build><item objectid="${objectId}" printable="1"/></build>\n</model>\n`
+  const settings =
+    '<?xml version="1.0" encoding="UTF-8"?>\n<config>\n' +
+    `  <object id="${objectId}">\n    <metadata key="name" value="${escapeXml(title)}"/>\n    <metadata key="extruder" value="1"/>\n` +
+    parts.join('\n') +
+    '\n  </object>\n  <plate>\n    <metadata key="plater_id" value="1"/>\n    <metadata key="locked" value="false"/>\n' +
+    `    <model_instance>\n      <metadata key="object_id" value="${objectId}"/>\n      <metadata key="instance_id" value="0"/>\n    </model_instance>\n` +
+    '  </plate>\n</config>\n'
+  return zipSync({
+    '[Content_Types].xml': strToU8(CONTENT_TYPES_XML),
+    '_rels/.rels': strToU8(RELS_XML),
+    '3D/3dmodel.model': strToU8(model),
+    'Metadata/model_settings.config': strToU8(settings)
+  })
+}
+
+function writeSimple3mf(mesh: NamedMesh, title: string): Uint8Array {
   const model =
     '<?xml version="1.0" encoding="UTF-8"?>\n' +
     '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n' +
     `<metadata name="Title">${escapeXml(title)}</metadata>\n<metadata name="Application">3D Studio</metadata>\n` +
-    `<resources>${resources.join('\n')}</resources>\n<build>${items.join('')}</build>\n</model>\n`
+    `<resources><object id="1" name="${escapeXml(mesh.name)}" type="model">${meshXml(mesh.triangles)}</object></resources>\n<build><item objectid="1"/></build>\n</model>\n`
   return zipSync({
     '[Content_Types].xml': strToU8(CONTENT_TYPES_XML),
     '_rels/.rels': strToU8(RELS_XML),

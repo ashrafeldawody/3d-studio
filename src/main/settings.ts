@@ -69,7 +69,8 @@ const DEFAULTS: Settings = {
   bedY: 270,
   bedZ: 270,
   printerName: '',
-  recentProjects: []
+  recentProjects: [],
+  slicerPreferences: {}
 }
 
 const settingsFile = (): string => join(app.getPath('userData'), 'settings.json')

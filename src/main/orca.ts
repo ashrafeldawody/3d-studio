@@ -8,7 +8,7 @@ import { CONTENT_TYPES_XML, RELS_XML, Triangle, Vec3, escapeXml, meshXml } from 
 
 const META_KEYS = new Set(['name', 'inherits', 'from', 'instantiation', 'setting_id', 'type', 'description', 'renamed_from', 'is_custom_defined'])
 const SKIPPED_FILAMENT_KEYS = new Set(['compatible_printers', 'compatible_prints', 'compatible_printers_condition', 'compatible_prints_condition'])
-const PLATE_GAP = 6
+const PLATE_GAP = 10
 const APP_ORDER: SlicerApp[] = ['bambu', 'snapmaker', 'orca']
 const FALLBACK: Record<SlicerApp, SlicerApp[]> = {
   bambu: ['bambu', 'orca', 'snapmaker'],
@@ -225,11 +225,16 @@ function arrange(footprints: [number, number][], bed: [number, number, number, n
   return { positions, overflow: cursorY + rowHeight > y1 - PLATE_GAP + 0.01 }
 }
 
+export interface SlicerObjectPart {
+  color: string
+  triangles: Triangle[]
+}
+
 export interface SlicerObjectMesh {
   name: string
   filament: number
   copies: number
-  triangles: Triangle[]
+  parts: SlicerObjectPart[]
 }
 
 export function buildSlicerProject(request: SlicerExportRequest, meshes: SlicerObjectMesh[]): string {
@@ -241,10 +246,10 @@ export function buildSlicerProject(request: SlicerExportRequest, meshes: SlicerO
   const bed = bedSize(config)
   const objects: { mesh: SlicerObjectMesh; offset: Vec3; footprint: [number, number] }[] = []
   for (const mesh of meshes) {
-    if (!mesh.triangles.length) throw new Error(`"${mesh.name}" is empty.`)
+    if (!mesh.parts.some((part) => part.triangles.length)) throw new Error(`"${mesh.name}" is empty.`)
     const min: Vec3 = [Infinity, Infinity, Infinity]
     const max: Vec3 = [-Infinity, -Infinity, -Infinity]
-    for (const triangle of mesh.triangles) {
+    for (const triangle of mesh.parts.flatMap((part) => part.triangles)) {
       for (const point of triangle) {
         for (let axis = 0; axis < 3; axis++) {
           min[axis] = Math.min(min[axis], point[axis])
@@ -266,23 +271,42 @@ export function buildSlicerProject(request: SlicerExportRequest, meshes: SlicerO
   const buildItems: string[] = []
   const settingsXml: string[] = []
   const plateXml: string[] = []
+  const filamentCount = Math.max(1, request.filaments.length)
+  const filamentFor = (color: string, fallback: number): number => {
+    const mapped = color ? request.colorMap[color] : undefined
+    return Math.min(filamentCount, Math.max(1, mapped ?? fallback))
+  }
   objects.forEach((object, index) => {
-    const partId = nextId++
-    resources.push(`<object id="${partId}" type="model">${meshXml(object.mesh.triangles, object.offset)}</object>`)
+    const name = escapeXml(object.mesh.name)
+    const parts = object.mesh.parts.filter((part) => part.triangles.length)
+    const partXml: string[] = []
+    const components: string[] = []
+    for (const part of parts) {
+      const partId = nextId++
+      const filament = filamentFor(part.color, object.mesh.filament)
+      const partName = parts.length > 1 ? escapeXml(`${object.mesh.name} - filament ${filament}${part.color ? ` (${part.color})` : ''}`) : name
+      resources.push(`<object id="${partId}" type="model">${meshXml(part.triangles, object.offset)}</object>`)
+      components.push(`<component objectid="${partId}"/>`)
+      partXml.push(
+        [
+          `    <part id="${partId}" subtype="normal_part">`,
+          `      <metadata key="name" value="${partName}"/>`,
+          `      <metadata key="extruder" value="${filament}"/>`,
+          '    </part>'
+        ].join('\n')
+      )
+    }
     const objectId = nextId++
-    resources.push(`<object id="${objectId}" type="model"><components><component objectid="${partId}"/></components></object>`)
+    resources.push(`<object id="${objectId}" type="model"><components>${components.join('')}</components></object>`)
     const [x, y] = positions[index]
     buildItems.push(`<item objectid="${objectId}" transform="1 0 0 0 1 0 0 0 1 ${x.toFixed(3)} ${y.toFixed(3)} 0" printable="1"/>`)
-    const name = escapeXml(object.mesh.name)
+    const objectFilament = filamentFor(parts[0]?.color ?? '', object.mesh.filament)
     settingsXml.push(
       [
         `  <object id="${objectId}">`,
         `    <metadata key="name" value="${name}"/>`,
-        `    <metadata key="extruder" value="${object.mesh.filament}"/>`,
-        `    <part id="${partId}" subtype="normal_part">`,
-        `      <metadata key="name" value="${name}"/>`,
-        `      <metadata key="extruder" value="${object.mesh.filament}"/>`,
-        '    </part>',
+        `    <metadata key="extruder" value="${objectFilament}"/>`,
+        ...partXml,
         '  </object>'
       ].join('\n')
     )

@@ -381,7 +381,7 @@ function registerIpc(): void {
     if (payload.format === 'stl') writeFileSync(choice.filePath, result.stl)
     else {
       const parts = result.parts ?? [{ color: '', stl: result.stl }]
-      const meshes = parts.map((part) => ({ name: part.color ? safeName(`${name}-${part.color}`) : name, triangles: readStl(part.stl) }))
+      const meshes = parts.map((part) => ({ name: part.color ? safeName(`${name}-${part.color}`) : name, triangles: readStl(part.stl), color: part.color }))
       writeFileSync(choice.filePath, write3mf(meshes, name))
     }
     return choice.filePath
@@ -414,7 +414,8 @@ function registerIpc(): void {
       if (!result.ok || !result.stl) {
         throw new Error(`"${object.name}" did not render: ${result.errors.map((error) => error.text).join('; ')}`)
       }
-      meshes.push({ name: object.name, filament: object.filament, copies: object.copies, triangles: readStl(result.stl) })
+      const parts = (result.parts ?? [{ color: '', stl: result.stl }]).map((part) => ({ color: part.color, triangles: readStl(part.stl) }))
+      meshes.push({ name: object.name, filament: object.filament, copies: object.copies, parts })
     }
     const summary = buildSlicerProject(payload.request, meshes)
     return `${payload.request.outputPath}: ${summary}`

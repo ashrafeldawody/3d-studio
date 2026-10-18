@@ -1,17 +1,24 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { SlicerApp, SlicerFilament, SlicerObject, SlicerPresetList } from '@shared/types'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { SlicerApp, SlicerFilament, SlicerObject, SlicerPreferences, SlicerPresetList } from '@shared/types'
 import { SLICER_APP_LABEL } from '@shared/types'
+import { parseScadColor } from '../lib/viewer'
+
+const toHex = (color: string): string => `#${parseScadColor(color).getHexString()}`
 
 interface Props {
   app: SlicerApp
   projectName: string
   parts: string[]
   currentPart: string
+  modelColors: string[]
+  saved: SlicerPreferences | null
+  onSavePreferences(preferences: SlicerPreferences): void
   onExport(payload: {
     printer: string
     process: string
     filaments: SlicerFilament[]
     objects: SlicerObject[]
+    colorMap: Record<string, number>
     settings: Record<string, string>
   }): Promise<void>
   onClose(): void
@@ -19,7 +26,7 @@ interface Props {
 
 const STORAGE_KEY = 'slicer-export-preferences'
 
-interface Preferences {
+interface LegacyPreferences {
   printer: string
   process: string
   filaments: SlicerFilament[]
@@ -27,7 +34,40 @@ interface Preferences {
   brim: boolean
 }
 
-function loadPreferences(app: SlicerApp): Preferences | null {
+function legacyPreferences(app: SlicerApp): SlicerPreferences | null {
+  const legacy = loadPreferences(app)
+  return legacy ? { ...legacy, colorMap: {} } : null
+}
+
+function initialFilaments(saved: SlicerPreferences | null, modelColors: string[]): { filaments: SlicerFilament[]; colorMap: Record<string, number> } {
+  const savedFilaments = saved?.filaments?.length ? saved.filaments : null
+  if (!modelColors.length) return { filaments: savedFilaments ?? [{ preset: '', colour: '#161616' }], colorMap: { ...(saved?.colorMap ?? {}) } }
+  if (!savedFilaments) {
+    return {
+      filaments: modelColors.map((color) => ({ preset: '', colour: toHex(color) })),
+      colorMap: Object.fromEntries(modelColors.map((color, index) => [color, index + 1]))
+    }
+  }
+  const filaments = [...savedFilaments]
+  const colorMap: Record<string, number> = { ...(saved?.colorMap ?? {}) }
+  for (const color of modelColors) {
+    const slot = colorMap[color]
+    if (slot && slot <= filaments.length) continue
+    const hex = toHex(color).toLowerCase()
+    const sameColour = filaments.findIndex((filament) => filament.colour.toLowerCase() === hex)
+    if (sameColour !== -1) {
+      colorMap[color] = sameColour + 1
+    } else if (filaments.length < 16) {
+      filaments.push({ preset: filaments[0]?.preset ?? '', colour: hex })
+      colorMap[color] = filaments.length
+    } else {
+      colorMap[color] = 1
+    }
+  }
+  return { filaments, colorMap }
+}
+
+function loadPreferences(app: SlicerApp): LegacyPreferences | null {
   try {
     const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
     if (!raw) return null
@@ -37,18 +77,6 @@ function loadPreferences(app: SlicerApp): Preferences | null {
   } catch {
     return null
   }
-}
-
-function savePreferences(app: SlicerApp, preferences: Preferences): void {
-  let raw: { byApp?: Partial<Record<SlicerApp, Preferences>> } = {}
-  try {
-    raw = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') ?? {}
-  } catch {
-    raw = {}
-  }
-  const byApp = raw.byApp ?? {}
-  byApp[app] = preferences
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ byApp }))
 }
 
 function preferredPrinter(app: SlicerApp, printers: string[]): string {
@@ -99,12 +127,16 @@ function PresetSelect({ value, options, onChange }: { value: string; options: st
   )
 }
 
-export function SlicerDialog({ app, projectName, parts, currentPart, onExport, onClose }: Props) {
+export function SlicerDialog({ app, projectName, parts, currentPart, modelColors, saved: savedPreferences, onSavePreferences, onExport, onClose }: Props) {
   const [presets, setPresets] = useState<SlicerPresetList | null>(null)
-  const saved = loadPreferences(app)
+  const [saved] = useState(() => savedPreferences ?? legacyPreferences(app))
+  const [initial] = useState(() => initialFilaments(saved, modelColors))
   const [printer, setPrinter] = useState(saved?.printer ?? '')
   const [process, setProcess] = useState(saved?.process ?? '')
-  const [filaments, setFilaments] = useState<SlicerFilament[]>(saved?.filaments ?? [{ preset: '', colour: '#161616' }])
+  const [filaments, setFilaments] = useState<SlicerFilament[]>(initial.filaments)
+  const [colorMap, setColorMap] = useState<Record<string, number>>(initial.colorMap)
+  const saveCallback = useRef(onSavePreferences)
+  saveCallback.current = onSavePreferences
   const [infill, setInfill] = useState(saved?.infill ?? '15%')
   const [brim, setBrim] = useState(saved?.brim ?? false)
   const selectable = parts.length ? parts : ['']
@@ -138,17 +170,31 @@ export function SlicerDialog({ app, projectName, parts, currentPart, onExport, o
     )
   }, [filamentOptions])
 
+  const removeFilament = (index: number): void => {
+    setFilaments(filaments.filter((_, i) => i !== index))
+    const slot = index + 1
+    setColorMap(Object.fromEntries(Object.entries(colorMap).map(([color, value]) => [color, value === slot ? 1 : value > slot ? value - 1 : value])))
+    setObjects(objects.map((object) => ({ ...object, filament: object.filament === slot ? 1 : object.filament > slot ? object.filament - 1 : object.filament })))
+  }
+
+  useEffect(() => {
+    if (!presets || !printer) return
+    const timer = setTimeout(() => saveCallback.current({ printer, process, filaments, colorMap, infill, brim }), 300)
+    return () => clearTimeout(timer)
+  }, [presets, printer, process, filaments, colorMap, infill, brim])
+
   const submit = async (): Promise<void> => {
     setBusy(true)
     setError(null)
-    savePreferences(app, { printer, process, filaments, infill, brim })
+    onSavePreferences({ printer, process, filaments, colorMap, infill, brim })
     const settings: Record<string, string> = { enable_prime_tower: '0', sparse_infill_density: infill }
     if (brim) {
       settings.brim_type = 'outer_only'
       settings.brim_width = '3'
     }
     try {
-      await onExport({ printer, process, filaments, objects, settings })
+      const safeMap = Object.fromEntries(Object.entries(colorMap).map(([color, slot]) => [color, Math.min(filaments.length, Math.max(1, slot))]))
+      await onExport({ printer, process, filaments, objects, colorMap: safeMap, settings })
       onClose()
     } catch (exportError) {
       setError((exportError as Error).message)
@@ -194,6 +240,35 @@ export function SlicerDialog({ app, projectName, parts, currentPart, onExport, o
               <span>Print settings</span>
               <PresetSelect value={process} options={processes} onChange={setProcess} />
             </label>
+            {modelColors.length > 0 && (
+              <>
+                <h3>Colours in the model</h3>
+                <p className="hint">Pick which printer filament prints each colour. Several colours can share one filament.</p>
+                {modelColors.map((color) => (
+                  <div key={color} className="row filament-row">
+                    <span className="color-chip" style={{ background: toHex(color) }} />
+                    <span className="color-name">{color}</span>
+                    <span className="muted">→</span>
+                    <select value={colorMap[color] ?? 1} onChange={(event) => setColorMap({ ...colorMap, [color]: Number(event.target.value) })}>
+                      {filaments.map((filament, index) => (
+                        <option key={index} value={index + 1}>
+                          Filament {index + 1} · {filament.preset || 'choose preset'} ({filament.colour})
+                        </option>
+                      ))}
+                    </select>
+                    <span className="color-chip" style={{ background: filaments[(colorMap[color] ?? 1) - 1]?.colour ?? '#888' }} />
+                  </div>
+                ))}
+                <button
+                  onClick={() => {
+                    setFilaments(modelColors.map((color, index) => ({ preset: filaments[index]?.preset ?? filaments[0]?.preset ?? '', colour: toHex(color) })))
+                    setColorMap(Object.fromEntries(modelColors.map((color, index) => [color, index + 1])))
+                  }}
+                >
+                  One filament per colour
+                </button>
+              </>
+            )}
             <h3>Filaments</h3>
             {filaments.map((filament, index) => (
               <div key={index} className="row filament-row">
@@ -208,7 +283,7 @@ export function SlicerDialog({ app, projectName, parts, currentPart, onExport, o
                   options={filamentOptions}
                   onChange={(preset) => setFilaments(filaments.map((item, i) => (i === index ? { ...item, preset } : item)))}
                 />
-                {filaments.length > 1 && <button onClick={() => setFilaments(filaments.filter((_, i) => i !== index))}>✕</button>}
+                {filaments.length > 1 && <button onClick={() => removeFilament(index)}>✕</button>}
               </div>
             ))}
             {filaments.length < 16 && (
