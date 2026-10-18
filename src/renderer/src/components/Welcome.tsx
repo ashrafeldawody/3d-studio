@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { ChatAttachments } from '@shared/types'
-import { readImageFile } from '../lib/images'
+import { formatFileSize, readChatFiles } from '../lib/chatFiles'
 
 interface Props {
   recent: string[]
@@ -25,22 +25,27 @@ export function Welcome({ recent, onStart, onCreateEmpty, onOpen, onImport, onOp
   const [name, setName] = useState('')
   const [prompt, setPrompt] = useState('')
   const [images, setImages] = useState<ChatAttachments['images']>([])
+  const [files, setFiles] = useState<NonNullable<ChatAttachments['files']>>([])
 
-  const addFiles = async (files: File[]): Promise<void> => {
-    const added = await Promise.all(files.filter((file) => file.type.startsWith('image/')).map(readImageFile))
-    setImages((current) => [...current, ...added])
+  const addFiles = async (dropped: File[]): Promise<void> => {
+    const read = await readChatFiles(dropped)
+    setImages((current) => [...current, ...read.images])
+    setFiles((current) => [...current, ...read.files])
   }
 
+  const hasInput = Boolean(prompt.trim() || images.length || files.length)
+
   const start = (): void => {
-    if (!prompt.trim() && !images.length) return
-    onStart(name.trim(), prompt.trim() ||'Make the part shown in the photo.', { images, pins: [] })
+    if (!hasInput) return
+    const fallback = images.length ? 'Make the part shown in the photo.' : 'Make the part described in the attached files.'
+    onStart(name.trim(), prompt.trim() || fallback, { images, pins: [], files })
   }
 
   return (
     <div className="welcome">
       <div className="welcome-card">
         <h1>What do you want to make?</h1>
-        <p className="muted">Describe it in your own words. Add a photo or a sketch if it helps. You can change anything afterwards just by asking.</p>
+        <p className="muted">Describe it, or start from a blank plate and build it with shapes, move, rotate and scale. The chat is optional.</p>
         <input
           className="welcome-name"
           value={name}
@@ -54,16 +59,19 @@ export function Welcome({ recent, onStart, onCreateEmpty, onOpen, onImport, onOp
           value={prompt}
           placeholder="e.g. A holder for my TV remote that sticks to the side of the desk"
           onChange={(event) => setPrompt(event.target.value)}
+          data-chat-drop
           onPaste={(event) => {
-            const files = [...event.clipboardData.files]
-            if (files.length) {
+            const pasted = [...event.clipboardData.files]
+            if (pasted.length) {
               event.preventDefault()
-              addFiles(files)
+              addFiles(pasted)
             }
           }}
           onDrop={(event) => {
+            const dropped = [...event.dataTransfer.files]
+            if (!dropped.length) return
             event.preventDefault()
-            addFiles([...event.dataTransfer.files])
+            addFiles(dropped)
           }}
           onDragOver={(event) => event.preventDefault()}
           onKeyDown={(event) => {
@@ -73,6 +81,18 @@ export function Welcome({ recent, onStart, onCreateEmpty, onOpen, onImport, onOp
             }
           }}
         />
+        {files.length > 0 && (
+          <div className="composer-attachments">
+            {files.map((item, index) => (
+              <div key={`${item.name}-${index}`} className="attachment-file" title={item.path ?? item.name}>
+                <span className="attachment-file-icon">📄</span>
+                <span className="attachment-file-name">{item.name}</span>
+                <small>{formatFileSize(item.size)}</small>
+                <button onClick={() => setFiles(files.filter((_, i) => i !== index))}>✕</button>
+              </div>
+            ))}
+          </div>
+        )}
         {images.length > 0 && (
           <div className="welcome-images">
             {images.map((image, index) => (
@@ -85,10 +105,9 @@ export function Welcome({ recent, onStart, onCreateEmpty, onOpen, onImport, onOp
         )}
         <div className="welcome-row">
           <label className="attach-button">
-            📎 Add photo or sketch
+            📎 Add photos or files
             <input
               type="file"
-              accept="image/*"
               multiple
               hidden
               onChange={(event) => {
@@ -97,7 +116,8 @@ export function Welcome({ recent, onStart, onCreateEmpty, onOpen, onImport, onOp
               }}
             />
           </label>
-          <button className="primary big" disabled={!prompt.trim() && !images.length} onClick={start}>
+          <button onClick={onCreateEmpty}>Blank plate</button>
+          <button className="primary big" disabled={!hasInput} onClick={start}>
             Make it →
           </button>
         </div>
@@ -109,9 +129,10 @@ export function Welcome({ recent, onStart, onCreateEmpty, onOpen, onImport, onOp
           ))}
         </div>
         <div className="welcome-secondary">
-          <button onClick={onImport}>Change an existing file (STL / 3MF / SCAD)</button>
+          <button onClick={onImport} title="Or drag a file anywhere onto this window">
+            Open a file (STL / 3MF / SVG / SCAD)
+          </button>
           <button onClick={onOpen}>Open a project</button>
-          <button onClick={onCreateEmpty}>Start empty</button>
           <button onClick={onSettings}>Settings</button>
         </div>
         {recent.length > 0 && (

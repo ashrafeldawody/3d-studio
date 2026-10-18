@@ -1,7 +1,7 @@
 import { FSWatcher, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, watch, writeFileSync } from 'fs'
 import { basename, extname, join } from 'path'
 import { findParts } from '@shared/scad'
-import type { ChatMessage, HistoryEntry, Operation, ProjectState } from '@shared/types'
+import type { ChatMessage, CliAgent, HistoryEntry, Operation, ProjectState, VectorArtwork } from '@shared/types'
 import { read3mf, readStl, safeName, writeBinaryStl } from './mesh'
 
 export const MODEL_FILE = 'model.scad'
@@ -15,6 +15,7 @@ interface ProjectMeta {
 interface ChatStore {
   messages: ChatMessage[]
   claudeSessionId?: string
+  agentSessions?: Partial<Record<CliAgent, string>>
   openrouterTranscript?: unknown[]
 }
 
@@ -25,22 +26,7 @@ const historyIndex = (dir: string): string => join(historyDir(dir), 'index.json'
 const chatFile = (dir: string): string => join(studioDir(dir), 'chat.json')
 export const assetsDir = (dir: string): string => join(dir, 'assets')
 
-const NEW_MODEL_TEMPLATE = `part = "assembly";
-
-wall = 2;
-width = 40;
-depth = 30;
-height = 20;
-
-module box_body() {
-    difference() {
-        cube([width, depth, height]);
-        translate([wall, wall, wall]) cube([width - 2 * wall, depth - 2 * wall, height]);
-    }
-}
-
-if (part == "assembly") box_body();
-`
+const NEW_MODEL_TEMPLATE = ''
 
 function readJson<T>(path: string, fallback: T): T {
   try {
@@ -88,7 +74,7 @@ export function loadProject(dir: string): ProjectState {
 
 export function listAssets(dir: string): string[] {
   try {
-    return readdirSync(assetsDir(dir)).filter((name) => /\.(stl|3mf|svg|dxf|png)$/i.test(name))
+    return readdirSync(assetsDir(dir)).filter((name) => /\.(stl|3mf|svg|dxf|png|scad)$/i.test(name))
   } catch {
     return []
   }
@@ -145,6 +131,7 @@ export function saveChat(dir: string, store: ChatStore): void {
 export interface ImportedMesh {
   file: string
   moduleName: string
+  color?: string
 }
 
 export function importMeshFile(dir: string, filePath: string): ImportedMesh[] {
@@ -171,7 +158,7 @@ export function importMeshFile(dir: string, filePath: string): ImportedMesh[] {
     return meshes.map((mesh) => {
       const name = uniqueName(mesh.name)
       writeFileSync(join(assetsDir(dir), `${name}.stl`), writeBinaryStl(mesh.triangles))
-      return { file: `assets/${name}.stl`, moduleName: moduleNameFor(name) }
+      return { file: `assets/${name}.stl`, moduleName: moduleNameFor(name), color: mesh.color }
     })
   }
   throw new Error(`Unsupported file type: ${extension}`)
@@ -182,17 +169,59 @@ const moduleNameFor = (name: string): string => {
   return /^\d/.test(cleaned) ? `mesh_${cleaned}` : cleaned
 }
 
+const meshCall = (mesh: ImportedMesh): string => (mesh.color ? `color("${mesh.color}") ${mesh.moduleName}();` : `${mesh.moduleName}();`)
+
 export function codeForImportedMeshes(meshes: ImportedMesh[]): string {
   const modules = meshes.map((mesh) => `module ${mesh.moduleName}() { import("${mesh.file}"); }`).join('\n')
-  if (meshes.length === 1) return `${modules}\n\n${meshes[0].moduleName}();\n`
-  const switches = meshes.map((mesh) => `if (part == "all" || part == "${mesh.moduleName}") ${mesh.moduleName}();`).join('\n')
+  if (meshes.length === 1) return `${modules}\n\n${meshCall(meshes[0])}\n`
+  const switches = meshes.map((mesh) => `if (part == "all" || part == "${mesh.moduleName}") ${meshCall(mesh)}`).join('\n')
   return `part = "all";\n\n${modules}\n\n${switches}\n`
 }
 
 export function appendImportedMeshes(code: string, meshes: ImportedMesh[]): string {
   const modules = meshes.map((mesh) => `module ${mesh.moduleName}() { import("${mesh.file}"); }`).join('\n')
-  const calls = meshes.map((mesh) => `${mesh.moduleName}();`).join('\n')
+  const calls = meshes.map(meshCall).join('\n')
   return `${code.trimEnd()}\n\n${modules}\n${calls}\n`
+}
+
+const ARTWORK_PREFIX = '__ART__'
+const PX_TO_MM = 25.4 / 96
+
+export function importArtwork(dir: string, artwork: VectorArtwork): { code: string; summary: string } {
+  ensureLayout(dir)
+  const used = new Set(listAssets(dir).map((name) => name.replace(/\.[^.]+$/, '')))
+  const base = safeName(artwork.fileName.replace(/\.svg$/i, ''))
+  let name = base
+  let suffix = 2
+  while (used.has(name)) name = `${base}-${suffix++}`
+  const prefix = moduleNameFor(name)
+  writeFileSync(join(assetsDir(dir), `${name}.scad`), artwork.library.split(ARTWORK_PREFIX).join(prefix))
+  const naturalWidth = artwork.width * PX_TO_MM
+  const width = Math.round(Math.min(Math.max(naturalWidth, 80), 150))
+  const height = Math.round((width * artwork.height) / artwork.width)
+  const calls = artwork.colors.map(({ color, module }) => `    color("${color}") linear_extrude(${prefix}_thickness) scale(s) ${prefix}_${module}();`)
+  const code = [
+    `use <assets/${name}.scad>`,
+    '',
+    `${prefix}_width = ${width};`,
+    `${prefix}_thickness = 3;`,
+    '',
+    `module ${prefix}() {`,
+    `    s = ${prefix}_width / ${Math.round(artwork.width * 1000) / 1000};`,
+    ...calls,
+    `}`,
+    '',
+    `${prefix}();`,
+    ''
+  ].join('\n')
+  const colours = artwork.colors.map(({ color, module }) => `${prefix}_${module}() is ${color}`).join(', ')
+  const summary =
+    `The SVG file "${artwork.fileName}" was converted exactly into 3D (no tracing or redrawing) and added to model.scad as the module ${prefix}(), ` +
+    `${width} x ${height} mm and ${prefix}_thickness mm thick. assets/${name}.scad holds the exact 2D artwork: one module per colour (${colours}), ` +
+    `all at the same scale, already cut so colours never overlap, plus ${prefix}_outline() for the whole silhouette. ` +
+    `Build on these modules (scale them with s = ${prefix}_width / ${Math.round(artwork.width * 1000) / 1000}) instead of redrawing the artwork; do not edit the asset file.` +
+    (artwork.warnings.length ? ` Notes from the conversion: ${artwork.warnings.join(' ')}` : '')
+  return { code, summary }
 }
 
 const lastOwnWrite = new Map<string, string>()

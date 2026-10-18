@@ -1,3 +1,6 @@
+import type { ChatImage } from '@shared/types'
+import { convertSvg } from './svgArtwork'
+
 const THUMBNAIL_SIZE = 220
 const MAX_IMAGE_SIZE = 1600
 
@@ -25,12 +28,24 @@ async function resized(source: string, limit: number, type: 'image/jpeg' | 'imag
 
 export const makeThumbnail = (dataUrl: string): Promise<string> => resized(dataUrl, THUMBNAIL_SIZE, 'image/jpeg', 0.75)
 
-export async function prepareImage(name: string, dataUrl: string): Promise<{ name: string; dataUrl: string; thumbnail: string }> {
+export async function prepareImage(name: string, dataUrl: string): Promise<ChatImage> {
   const full = await resized(dataUrl, MAX_IMAGE_SIZE, 'image/jpeg', 0.88)
   return { name, dataUrl: full, thumbnail: await makeThumbnail(full) }
 }
 
-export function readImageFile(file: File): Promise<{ name: string; dataUrl: string; thumbnail: string }> {
+export const isSvgFile = (file: File): boolean => file.type === 'image/svg+xml' || /.svg$/i.test(file.name)
+
+export async function readImageFile(file: File): Promise<ChatImage> {
+  const image = await readRasterImage(file)
+  if (!isSvgFile(file)) return image
+  try {
+    return { ...image, name: `Vector artwork from the user (${file.name})`, artwork: convertSvg(await file.text(), file.name) }
+  } catch {
+    return image
+  }
+}
+
+function readRasterImage(file: File): Promise<ChatImage> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = () => prepareImage(`Photo from the user (${file.name || 'pasted image'})`, reader.result as string).then(resolve, reject)

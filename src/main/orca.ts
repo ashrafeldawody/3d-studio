@@ -2,58 +2,132 @@ import { app } from 'electron'
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { strToU8, zipSync } from 'fflate'
-import type { SlicerExportRequest, SlicerPresetList } from '@shared/types'
+import type { SlicerApp, SlicerExportRequest, SlicerPresetList } from '@shared/types'
+import { SLICER_APP_LABEL } from '@shared/types'
 import { CONTENT_TYPES_XML, RELS_XML, Triangle, Vec3, escapeXml, meshXml } from './mesh'
 
 const META_KEYS = new Set(['name', 'inherits', 'from', 'instantiation', 'setting_id', 'type', 'description', 'renamed_from', 'is_custom_defined'])
 const SKIPPED_FILAMENT_KEYS = new Set(['compatible_printers', 'compatible_prints', 'compatible_printers_condition', 'compatible_prints_condition'])
-const SLICER_DIRS = ['Snapmaker_Orca', 'OrcaSlicer']
 const PLATE_GAP = 6
+const APP_ORDER: SlicerApp[] = ['bambu', 'snapmaker', 'orca']
+const FALLBACK: Record<SlicerApp, SlicerApp[]> = {
+  bambu: ['bambu', 'orca', 'snapmaker'],
+  snapmaker: ['snapmaker', 'orca', 'bambu'],
+  orca: ['orca', 'snapmaker', 'bambu']
+}
+const ROAMING: Record<SlicerApp, string> = {
+  bambu: 'BambuStudio',
+  snapmaker: 'Snapmaker_Orca',
+  orca: 'OrcaSlicer'
+}
+const INSTALL_NAMES: Record<SlicerApp, string[]> = {
+  bambu: ['Bambu Studio'],
+  snapmaker: ['Snapmaker Orca', 'SnapmakerOrca'],
+  orca: ['OrcaSlicer']
+}
 
 type Preset = Record<string, unknown>
 
-let presetCache: Map<string, Preset> | null = null
-
-function systemRoots(): string[] {
-  const appData = app.getPath('appData')
-  return SLICER_DIRS.map((name) => join(appData, name, 'system')).filter((path) => existsSync(path))
+interface LoadedPresets {
+  source: SlicerApp | null
+  presets: Map<string, Preset>
 }
+
+const presetCache = new Map<SlicerApp, { signature: string; presets: Map<string, Preset> }>()
+let session: { app: SlicerApp; source: SlicerApp | null; presets: Map<string, Preset> } | null = null
 
 function walkJson(dir: string, output: string[]): void {
   for (const name of readdirSync(dir)) {
     const path = join(dir, name)
-    const info = statSync(path)
+    let info: ReturnType<typeof statSync>
+    try {
+      info = statSync(path)
+    } catch {
+      continue
+    }
     if (info.isDirectory()) walkJson(path, output)
     else if (name.endsWith('.json')) output.push(path)
   }
 }
 
-function loadPresets(): Map<string, Preset> {
-  if (presetCache) return presetCache
+function rootSignature(roots: string[]): string {
+  return roots.map((root) => `${root}:${existsSync(root) ? statSync(root).mtimeMs : 0}`).join('|')
+}
+
+function presetRoots(source: SlicerApp): { base: string[]; user: string[] } {
+  const appData = app.getPath('appData')
+  const local = process.env.LOCALAPPDATA ?? ''
+  const programFiles = [process.env.ProgramFiles, process.env['ProgramFiles(x86)']].filter((path): path is string => Boolean(path))
+  const roaming = join(appData, ROAMING[source])
+  const system = [join(roaming, 'system')].filter((path) => existsSync(path))
+  const user = [join(roaming, 'user')].filter((path) => existsSync(path))
+  const bundled = INSTALL_NAMES[source].flatMap((name) => [
+    ...programFiles.map((root) => join(root, name, 'resources', 'profiles')),
+    local ? join(local, 'Programs', name, 'resources', 'profiles') : ''
+  ]).filter((path) => path && existsSync(path))
+  return { base: system.length ? system : bundled, user }
+}
+
+function appInstalled(source: SlicerApp): boolean {
+  const roots = presetRoots(source)
+  return roots.base.length + roots.user.length > 0
+}
+
+function instantiated(data: Preset): boolean {
+  const value = data.instantiation
+  return value === undefined || value === true || value === 'true'
+}
+
+function presetKind(file: string, data: Preset): string | null {
+  if (typeof data.type === 'string') return data.type
+  const path = file.replace(/\\/g, '/').toLowerCase()
+  if (path.includes('/machine/')) return 'machine'
+  if (path.includes('/process/')) return 'process'
+  if (path.includes('/filament/')) return 'filament'
+  return null
+}
+
+function readPresets(source: SlicerApp): Map<string, Preset> {
+  const roots = presetRoots(source)
+  const ordered = [...roots.base, ...roots.user]
+  const signature = rootSignature(ordered)
+  const cached = presetCache.get(source)
+  if (cached && cached.signature === signature) return cached.presets
   const presets = new Map<string, Preset>()
-  for (const root of systemRoots()) {
+  for (const root of ordered) {
     const files: string[] = []
     walkJson(root, files)
     for (const file of files) {
       try {
-        const data = JSON.parse(readFileSync(file, 'utf8'))
-        if (data && typeof data === 'object' && typeof data.name === 'string' && !presets.has(data.name)) {
-          presets.set(data.name, data)
-        }
+        const data = JSON.parse(readFileSync(file, 'utf8')) as Preset
+        if (!data || typeof data !== 'object' || Array.isArray(data) || typeof data.name !== 'string') continue
+        data.type = presetKind(file, data)
+        presets.set(data.name, data)
       } catch {
         continue
       }
     }
   }
-  presetCache = presets
+  presetCache.set(source, { signature, presets })
   return presets
 }
 
-export function listSlicerPresets(): SlicerPresetList {
-  const presets = loadPresets()
-  const result: SlicerPresetList = { printers: [], processes: [], filaments: [], found: presets.size > 0 }
-  presets.forEach((data, name) => {
-    if ((data.instantiation ?? 'true') !== 'true') return
+function loadFor(app: SlicerApp): LoadedPresets {
+  for (const source of FALLBACK[app]) {
+    const presets = readPresets(source)
+    if (presets.size) return { source, presets }
+  }
+  return { source: null, presets: new Map() }
+}
+
+export function listSlicerPresets(app: SlicerApp): SlicerPresetList {
+  presetCache.clear()
+  const installed = APP_ORDER.filter((candidate) => appInstalled(candidate))
+  const loaded = loadFor(app)
+  session = { app, source: loaded.source, presets: loaded.presets }
+  const result: SlicerPresetList = { app, source: loaded.source, installed, printers: [], processes: [], filaments: [], found: false }
+  loaded.presets.forEach((data, name) => {
+    if (!instantiated(data)) return
     if (data.type === 'machine') result.printers.push(name)
     else if (data.type === 'process') result.processes.push(name)
     else if (data.type === 'filament') result.filaments.push(name)
@@ -61,17 +135,28 @@ export function listSlicerPresets(): SlicerPresetList {
   result.printers.sort()
   result.processes.sort()
   result.filaments.sort()
+  result.found = result.printers.length > 0 && result.processes.length > 0
   return result
+}
+
+function presetsFor(app: SlicerApp): Map<string, Preset> {
+  if (session?.app === app && session.presets.size) return session.presets
+  const loaded = loadFor(app)
+  session = { app, source: loaded.source, presets: loaded.presets }
+  return loaded.presets
 }
 
 function resolvePreset(presets: Map<string, Preset>, name: string): Preset {
   const chain: Preset[] = []
+  const seen = new Set<string>()
   let current: string | undefined = name
   while (current) {
+    if (seen.has(current)) break
+    seen.add(current)
     const preset = presets.get(current)
     if (!preset) throw new Error(`Slicer preset not found: "${current}"`)
     chain.push(preset)
-    current = preset.inherits as string | undefined
+    current = typeof preset.inherits === 'string' && preset.inherits ? preset.inherits : undefined
   }
   const merged: Preset = {}
   for (const preset of chain.reverse()) {
@@ -108,7 +193,7 @@ function buildProjectConfig(presets: Map<string, Preset>, request: SlicerExportR
   config.flush_volumes_vector = new Array(2 * count).fill('0')
   Object.assign(config, request.settings)
   config.different_settings_to_system = [Object.keys(request.settings).join(';'), ...new Array(count).fill(''), '']
-  config.version = '2.3.1'
+  if (!config.version) config.version = request.app === 'bambu' ? '1.9.1' : '2.3.1'
   config.name = 'project_settings'
   config.from = 'project'
   return config
@@ -148,8 +233,10 @@ export interface SlicerObjectMesh {
 }
 
 export function buildSlicerProject(request: SlicerExportRequest, meshes: SlicerObjectMesh[]): string {
-  const presets = loadPresets()
-  if (!presets.size) throw new Error('No Snapmaker Orca or OrcaSlicer presets were found on this computer.')
+  const presets = presetsFor(request.app)
+  if (!presets.size) {
+    throw new Error(`No presets for ${SLICER_APP_LABEL[request.app]} were found. Install it, open it once, then export again. STL and 3MF still open in any slicer.`)
+  }
   const config = buildProjectConfig(presets, request)
   const bed = bedSize(config)
   const objects: { mesh: SlicerObjectMesh; offset: Vec3; footprint: [number, number] }[] = []

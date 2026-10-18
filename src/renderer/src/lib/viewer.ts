@@ -2,10 +2,11 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
-import type { ChatPin, Operation, Vector3, ViewName } from '@shared/types'
+import type { ChatPin, ColorPart, Operation, RenderedObject, Vector3, ViewName } from '@shared/types'
 
-export type ViewerMode = 'orbit' | 'measure' | 'pin' | 'draw'
+export type ViewerMode = 'orbit' | 'move' | 'measure' | 'pin' | 'draw'
 export type BoxGizmoMode = 'translate' | 'scale'
+export type ObjectGizmoMode = 'translate' | 'rotate' | 'scale'
 
 export type SnapKind = 'corner' | 'midpoint' | 'edge' | 'face' | 'bed'
 
@@ -33,6 +34,16 @@ const SNAP_COLORS: Record<SnapKind, number> = {
 
 const SNAP_PIXELS = { corner: 12, midpoint: 10, edge: 8 }
 
+export interface ViewerContext {
+  screenX: number
+  screenY: number
+  point: Vector3 | null
+  normal: Vector3 | null
+  bedPoint: Vector3 | null
+  objectIndex: number | null
+  color: string | null
+}
+
 export interface PinHit {
   point: Vector3
   normal: Vector3
@@ -43,6 +54,17 @@ export interface PinHit {
 const round = (value: number, digits = 2): number => {
   const factor = 10 ** digits
   return Math.round(value * factor) / factor
+}
+
+function axisAngle(quaternion: THREE.Quaternion): { axis: Vector3; degrees: number } | null {
+  const copy = quaternion.clone().normalize()
+  if (copy.w < 0) copy.set(-copy.x, -copy.y, -copy.z, -copy.w)
+  const w = Math.min(1, Math.max(-1, copy.w))
+  const degrees = THREE.MathUtils.radToDeg(2 * Math.acos(w))
+  if (degrees < 0.05) return null
+  const sine = Math.sqrt(Math.max(0, 1 - w * w))
+  const axis: Vector3 = sine < 1e-6 ? [0, 0, 1] : [copy.x / sine, copy.y / sine, copy.z / sine]
+  return { axis, degrees: Math.round(degrees * 10) / 10 }
 }
 
 const toVector3 = (vector: THREE.Vector3, digits = 2): Vector3 => [round(vector.x, digits), round(vector.y, digits), round(vector.z, digits)]
@@ -70,16 +92,29 @@ export class ModelViewer {
   private frame = 0
   private resizeObserver: ResizeObserver
   private raycaster = new THREE.Raycaster()
-  private bedSize: [number, number] = [270, 270]
+  private bedSize: [number, number, number] = [270, 270, 270]
   private wireframe = false
   private mode: ViewerMode = 'orbit'
   private editing: { operation: Operation; target: THREE.Object3D; start: THREE.Matrix4; startScale: THREE.Vector3; base: THREE.Matrix4 } | null = null
   private boxMode: BoxGizmoMode = 'translate'
   private ops: Operation[] = []
   private pointerDown: { x: number; y: number } | null = null
-  clickToPin = false
+  private objectsGroup = new THREE.Group()
+  private objectMeshes: THREE.Mesh[] = []
+  private selectedObject: THREE.Mesh | null = null
+  private objectDrag: { mesh: THREE.Mesh; plane: THREE.Plane; offset: THREE.Vector3; start: THREE.Vector3; moved: boolean } | null = null
+  private gizmoMoveStart: THREE.Vector3 | null = null
+  private objectGizmoMode: ObjectGizmoMode = 'translate'
+  private pivotGroup: THREE.Group | null = null
+  private pendingSelection: number | null = null
+  onContextMenu: ((context: ViewerContext) => void) | null = null
+  onObjectSelect: ((index: number | null) => void) | null = null
+  onObjectMove: ((index: number, delta: Vector3) => void) | null = null
+  onObjectRotate: ((index: number, axis: Vector3, degrees: number, center: Vector3) => void) | null = null
+  onObjectScale: ((index: number, factor: Vector3, center: Vector3) => void) | null = null
   onMeasure: ((result: MeasureResult) => void) | null = null
   onPin: ((hit: PinHit) => void) | null = null
+  onPinRemove: ((id: number) => void) | null = null
   onEditCommit: ((operation: Operation) => void) | null = null
 
   constructor(private container: HTMLElement) {
@@ -100,6 +135,10 @@ export class ModelViewer {
     })
     this.gizmo.addEventListener('objectChange', () => this.previewEdit())
     this.gizmo.addEventListener('mouseUp', () => this.commitEdit())
+    this.gizmo.addEventListener('mouseDown', () => {
+      this.gizmoMoveStart = this.selectedObject && !this.editing && this.objectGizmoMode === 'translate' ? this.selectedObject.position.clone() : null
+    })
+    this.gizmo.addEventListener('mouseUp', () => this.commitGizmoMove())
     this.scene.add(this.gizmo.getHelper())
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.6))
     const key = new THREE.DirectionalLight(0xffffff, 1.6)
@@ -108,7 +147,7 @@ export class ModelViewer {
     const fill = new THREE.DirectionalLight(0xffffff, 0.6)
     fill.position.set(-1.5, 1, 0.5)
     this.scene.add(fill)
-    this.scene.add(this.bed, this.axes, this.modelRoot, this.helpers, this.pinsGroup, this.measureGroup)
+    this.scene.add(this.bed, this.axes, this.modelRoot, this.objectsGroup, this.helpers, this.pinsGroup, this.measureGroup)
     this.buildBed()
     this.resizeObserver = new ResizeObserver(() => this.resize())
     this.resizeObserver.observe(container)
@@ -116,6 +155,8 @@ export class ModelViewer {
     this.renderer.domElement.addEventListener('pointerup', this.handlePointerUp)
     this.renderer.domElement.addEventListener('pointermove', this.handlePointerMove)
     this.renderer.domElement.addEventListener('pointerleave', this.hideMeasureHover)
+    window.addEventListener('pointerup', this.finishObjectDrag)
+    this.renderer.domElement.addEventListener('contextmenu', this.preventContextMenu)
     this.resize()
     this.loop()
   }
@@ -127,7 +168,10 @@ export class ModelViewer {
     this.renderer.domElement.removeEventListener('pointerup', this.handlePointerUp)
     this.renderer.domElement.removeEventListener('pointermove', this.handlePointerMove)
     this.renderer.domElement.removeEventListener('pointerleave', this.hideMeasureHover)
+    window.removeEventListener('pointerup', this.finishObjectDrag)
+    this.renderer.domElement.removeEventListener('contextmenu', this.preventContextMenu)
     cancelAnimationFrame(this.hoverFrame)
+    this.clearObjects()
     this.gizmo.detach()
     this.gizmo.dispose()
     this.controls.dispose()
@@ -135,8 +179,8 @@ export class ModelViewer {
     this.renderer.domElement.remove()
   }
 
-  setBedSize(x: number, y: number): void {
-    this.bedSize = [x, y]
+  setBedSize(x: number, y: number, z: number): void {
+    this.bedSize = [x, y, z]
     this.buildBed()
   }
 
@@ -155,6 +199,13 @@ export class ModelViewer {
     const grid = new THREE.BufferGeometry()
     grid.setAttribute('position', new THREE.Float32BufferAttribute(lines, 3))
     this.bed.add(new THREE.LineSegments(grid, new THREE.LineBasicMaterial({ color: 0x343a42 })))
+    const height = this.bedSize[2]
+    const volume = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(x, y, height)),
+      new THREE.LineBasicMaterial({ color: 0x4a5560, transparent: true, opacity: 0.5 })
+    )
+    volume.position.set(x / 2, y / 2, height / 2)
+    this.bed.add(volume)
     const axis = (to: [number, number, number], color: number): THREE.Line => {
       const geometry = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(...to)])
       return new THREE.Line(geometry, new THREE.LineBasicMaterial({ color }))
@@ -199,17 +250,17 @@ export class ModelViewer {
     this.renderer.render(this.scene, this.camera)
   }
 
-  showStl(data: Uint8Array, keepCamera: boolean): void {
-    const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer
-    const geometry = new STLLoader().parse(buffer)
-    geometry.computeVertexNormals()
+  showModel(parts: ColorPart[], keepCamera: boolean): void {
+    const geometry = mergeColorParts(parts)
+    const multicolor = parts.some((part) => part.color)
     const previousBounds = this.mesh ? this.bounds() : null
     this.clearModel()
     this.mesh = new THREE.Mesh(
       geometry,
-      new THREE.MeshStandardMaterial({ color: 0xf39200, roughness: 0.55, metalness: 0.05, wireframe: this.wireframe })
+      new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.55, metalness: 0.05, wireframe: this.wireframe })
     )
-    this.edges = new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 30), new THREE.LineBasicMaterial({ color: 0x6b3b00 }))
+    const edgeMaterial = new THREE.LineBasicMaterial({ color: multicolor ? 0x111111 : 0x6b3b00, transparent: multicolor, opacity: multicolor ? 0.45 : 1 })
+    this.edges = new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 30), edgeMaterial)
     this.modelRoot.add(this.mesh, this.edges)
     this.modelRoot.position.set(0, 0, 0)
     this.modelRoot.quaternion.identity()
@@ -233,6 +284,7 @@ export class ModelViewer {
   setWireframe(enabled: boolean): void {
     this.wireframe = enabled
     if (this.mesh) (this.mesh.material as THREE.MeshStandardMaterial).wireframe = enabled
+    for (const mesh of this.objectMeshes) (mesh.material as THREE.MeshStandardMaterial).wireframe = enabled
   }
 
   bounds(): THREE.Box3 {
@@ -304,6 +356,11 @@ export class ModelViewer {
     this.mode = mode
     this.controls.enabled = mode !== 'draw'
     this.renderer.domElement.style.cursor = mode === 'measure' || mode === 'pin' ? 'crosshair' : ''
+    if (mode !== 'move') {
+      this.objectDrag = null
+      if (this.selectedObject) this.applySelection(null)
+    }
+    this.updateObjectVisibility()
     if (mode !== 'measure') {
       this.clearMeasurements()
       this.hideMeasureHover()
@@ -331,7 +388,9 @@ export class ModelViewer {
 
   private rebuildHelpers(editOp: Operation | null = this.editing?.operation ?? null): void {
     this.gizmo.detach()
+    this.releasePivot()
     this.editing = null
+    if (this.selectedObject && !editOp) this.attachObjectGizmo(this.selectedObject)
     this.helpers.clear()
     const box = this.bounds()
     const size = box.getSize(new THREE.Vector3())
@@ -472,6 +531,311 @@ export class ModelViewer {
     }
   }
 
+  showObjects(objects: RenderedObject[]): void {
+    if (this.objectDrag || this.gizmo.dragging) return
+    const selectedIndex = (this.selectedObject?.userData.objectIndex as number | undefined) ?? this.pendingSelection ?? undefined
+    this.gizmo.detach()
+    this.releasePivot()
+    this.disposeObjectMeshes()
+    for (const object of objects) {
+      const geometry = mergeColorParts(object.parts)
+      const multicolor = object.parts.some((part) => part.color)
+      const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.55, metalness: 0.05, wireframe: this.wireframe }))
+      mesh.userData.objectIndex = object.index
+      const baseColor = multicolor ? 0x111111 : 0x6b3b00
+      const edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(geometry, 30),
+        new THREE.LineBasicMaterial({ color: baseColor, transparent: true, opacity: multicolor ? 0.45 : 1 })
+      )
+      edges.userData.baseColor = baseColor
+      edges.userData.baseOpacity = multicolor ? 0.45 : 1
+      mesh.add(edges)
+      this.objectsGroup.add(mesh)
+      this.objectMeshes.push(mesh)
+    }
+    this.updateObjectVisibility()
+    const reselect = this.mode === 'move' && selectedIndex !== undefined ? (this.objectMeshes.find((mesh) => mesh.userData.objectIndex === selectedIndex) ?? null) : null
+    if (reselect) this.pendingSelection = null
+    this.selectedObject = null
+    this.applySelection(reselect, selectedIndex !== undefined)
+  }
+
+  clearObjects(): void {
+    const hadSelection = this.selectedObject !== null
+    this.objectDrag = null
+    this.pendingSelection = null
+    this.gizmo.detach()
+    this.releasePivot()
+    this.selectedObject = null
+    this.disposeObjectMeshes()
+    this.updateObjectVisibility()
+    if (hadSelection) this.onObjectSelect?.(null)
+  }
+
+  private updateObjectVisibility(): void {
+    const showObjects = this.mode === 'move' && this.objectMeshes.length > 0
+    this.objectsGroup.visible = showObjects
+    this.modelRoot.visible = !showObjects
+  }
+
+  objectBounds(index: number): THREE.Box3 | null {
+    const mesh = this.objectMeshes.find((item) => item.userData.objectIndex === index)
+    return mesh ? new THREE.Box3().setFromObject(mesh) : null
+  }
+
+  lowestAfterRotation(index: number, axis: 'x' | 'y' | 'z', degrees: number): number | null {
+    const mesh = this.objectMeshes.find((item) => item.userData.objectIndex === index)
+    if (!mesh) return null
+    const center = new THREE.Box3().setFromObject(mesh).getCenter(new THREE.Vector3())
+    const rotation = new THREE.Matrix4().makeRotationAxis(new THREE.Vector3(axis === 'x' ? 1 : 0, axis === 'y' ? 1 : 0, axis === 'z' ? 1 : 0), THREE.MathUtils.degToRad(degrees))
+    const positions = mesh.geometry.getAttribute('position')
+    const point = new THREE.Vector3()
+    let lowest = Infinity
+    for (let vertex = 0; vertex < positions.count; vertex++) {
+      point.fromBufferAttribute(positions, vertex)
+      mesh.localToWorld(point)
+      point.sub(center).applyMatrix4(rotation).add(center)
+      lowest = Math.min(lowest, point.z)
+    }
+    return lowest
+  }
+
+  frameBox(box: THREE.Box3): void {
+    const center = box.getCenter(new THREE.Vector3())
+    const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 2)
+    const distance = (radius / Math.sin(THREE.MathUtils.degToRad(this.camera.fov / 2))) * 1.15
+    const direction = this.camera.position.clone().sub(this.controls.target).normalize()
+    this.controls.target.copy(center)
+    this.camera.position.copy(center).addScaledVector(direction, distance)
+    this.camera.near = Math.max(distance / 1000, 0.01)
+    this.camera.far = Math.max(this.camera.far, distance * 20)
+    this.camera.updateProjectionMatrix()
+    this.controls.update()
+  }
+
+  private preventContextMenu = (event: Event): void => {
+    event.preventDefault()
+  }
+
+  private contextAt(event: PointerEvent): ViewerContext {
+    const rect = this.renderer.domElement.getBoundingClientRect()
+    this.pointerRay(event)
+    const targets: THREE.Object3D[] = this.objectMeshes.length ? this.objectMeshes : this.mesh ? [this.mesh] : []
+    const hit = this.hitAny(targets)
+    const bed = this.raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), 0), new THREE.Vector3())
+    let color: string | null = null
+    let objectIndex: number | null = null
+    let normal: Vector3 | null = null
+    if (hit) {
+      const mesh = hit.object as THREE.Mesh
+      objectIndex = typeof mesh.userData.objectIndex === 'number' ? mesh.userData.objectIndex : null
+      const ranges = mesh.geometry.userData.colorRanges as { start: number; end: number; color: string }[] | undefined
+      const vertex = (hit.faceIndex ?? 0) * 3
+      color = ranges?.find((range) => vertex >= range.start && vertex < range.end)?.color ?? null
+      normal = hit.face ? toVector3(hit.face.normal.clone().transformDirection(mesh.matrixWorld)) : null
+    }
+    return {
+      screenX: event.clientX - rect.left,
+      screenY: event.clientY - rect.top,
+      point: hit ? toVector3(hit.point) : null,
+      normal,
+      bedPoint: bed ? toVector3(bed) : null,
+      objectIndex,
+      color
+    }
+  }
+
+  selectObject(index: number | null): void {
+    this.pendingSelection = index
+    const mesh = index === null ? null : (this.objectMeshes.find((item) => item.userData.objectIndex === index) ?? null)
+    if (index !== null && !mesh) return
+    this.pendingSelection = null
+    this.applySelection(mesh)
+  }
+
+  setObjectGizmoMode(mode: ObjectGizmoMode): void {
+    if (this.objectGizmoMode === mode) return
+    this.objectGizmoMode = mode
+    if (this.selectedObject && !this.editing && this.mode === 'move') this.attachObjectGizmo(this.selectedObject)
+  }
+
+  nudgeSelected(delta: Vector3): void {
+    const mesh = this.selectedObject
+    if (!mesh) return
+    const target = this.pivotGroup ?? mesh
+    target.position.add(new THREE.Vector3(...delta))
+    this.onObjectMove?.(mesh.userData.objectIndex as number, delta)
+  }
+
+  selectedBounds(): THREE.Box3 | null {
+    return this.selectedObject ? new THREE.Box3().setFromObject(this.selectedObject) : null
+  }
+
+  private disposeObjectMeshes(): void {
+    for (const mesh of this.objectMeshes) {
+      this.objectsGroup.remove(mesh)
+      mesh.geometry.dispose()
+      ;(mesh.material as THREE.Material).dispose()
+      const edges = mesh.children[0] as THREE.LineSegments | undefined
+      edges?.geometry.dispose()
+      ;(edges?.material as THREE.Material | undefined)?.dispose()
+    }
+    this.objectMeshes = []
+  }
+
+  private applySelection(mesh: THREE.Mesh | null, notify = true): void {
+    for (const item of this.objectMeshes) {
+      const selected = item === mesh
+      ;(item.material as THREE.MeshStandardMaterial).emissive.setHex(selected ? 0x1d3b52 : 0x000000)
+      const edges = item.children[0] as THREE.LineSegments | undefined
+      if (!edges) continue
+      const material = edges.material as THREE.LineBasicMaterial
+      material.color.setHex(selected ? 0x4fc3f7 : edges.userData.baseColor)
+      material.opacity = selected ? 1 : edges.userData.baseOpacity
+    }
+    const changed = this.selectedObject !== mesh
+    if (this.selectedObject && this.selectedObject !== mesh) this.releasePivot()
+    this.selectedObject = mesh
+    if (mesh) this.attachObjectGizmo(mesh)
+    else if (!this.editing) this.gizmo.detach()
+    if (changed && notify) this.onObjectSelect?.(mesh ? (mesh.userData.objectIndex as number) : null)
+  }
+
+  private releasePivot(): void {
+    const pivot = this.pivotGroup
+    this.pivotGroup = null
+    if (!pivot) return
+    const mesh = pivot.children.find((child): child is THREE.Mesh => child instanceof THREE.Mesh)
+    if (mesh) this.objectsGroup.attach(mesh)
+    pivot.removeFromParent()
+  }
+
+  private attachObjectGizmo(mesh: THREE.Mesh): void {
+    this.gizmo.detach()
+    this.releasePivot()
+    this.gizmo.showX = true
+    this.gizmo.showY = true
+    this.gizmo.showZ = true
+    this.gizmo.setSpace('world')
+    if (this.objectGizmoMode === 'translate') {
+      this.gizmo.setMode('translate')
+      this.gizmo.setTranslationSnap(0.5)
+      this.gizmo.setRotationSnap(null)
+      this.gizmo.setScaleSnap(null)
+      this.gizmo.attach(mesh)
+      return
+    }
+    const center = new THREE.Box3().setFromObject(mesh).getCenter(new THREE.Vector3())
+    const pivot = new THREE.Group()
+    pivot.position.copy(center)
+    this.objectsGroup.add(pivot)
+    pivot.attach(mesh)
+    this.pivotGroup = pivot
+    this.gizmo.setMode(this.objectGizmoMode)
+    this.gizmo.setTranslationSnap(null)
+    this.gizmo.setRotationSnap(this.objectGizmoMode === 'rotate' ? THREE.MathUtils.degToRad(1) : null)
+    this.gizmo.setScaleSnap(this.objectGizmoMode === 'scale' ? 0.01 : null)
+    this.gizmo.attach(pivot)
+  }
+
+  private commitGizmoMove(): void {
+    const mesh = this.selectedObject
+    const start = this.gizmoMoveStart
+    this.gizmoMoveStart = null
+    if (!mesh || this.editing) return
+    if (this.objectGizmoMode === 'translate') {
+      if (start) this.reportMove(mesh, start)
+      return
+    }
+    const pivot = this.pivotGroup
+    if (!pivot) return
+    const index = mesh.userData.objectIndex as number
+    const center = toVector3(pivot.position, 3)
+    if (this.objectGizmoMode === 'rotate') {
+      const turn = axisAngle(pivot.quaternion)
+      if (!turn) {
+        pivot.quaternion.identity()
+        return
+      }
+      this.onObjectRotate?.(index, turn.axis, turn.degrees, center)
+      return
+    }
+    const factor = toVector3(pivot.scale, 4)
+    if (factor.every((value) => Math.abs(value - 1) < 1e-3)) {
+      pivot.scale.set(1, 1, 1)
+      return
+    }
+    this.onObjectScale?.(index, factor, center)
+  }
+
+  private reportMove(mesh: THREE.Mesh, start: THREE.Vector3): void {
+    const delta = mesh.position.clone().sub(start)
+    if (delta.length() < 1e-4) return
+    this.onObjectMove?.(mesh.userData.objectIndex as number, toVector3(delta))
+  }
+
+  private hitAny(targets: THREE.Object3D[]): THREE.Intersection | null {
+    if (!targets.length) return null
+    const touched: { object: THREE.Object3D; visible: boolean }[] = []
+    const reveal = (object: THREE.Object3D | null): void => {
+      while (object) {
+        if (!object.visible) {
+          touched.push({ object, visible: false })
+          object.visible = true
+        }
+        object = object.parent
+      }
+    }
+    targets.forEach(reveal)
+    const hit = this.raycaster.intersectObjects(targets, false)[0] ?? null
+    for (const item of touched) item.object.visible = item.visible
+    return hit
+  }
+
+  private pointerRay(event: PointerEvent): void {
+    const rect = this.renderer.domElement.getBoundingClientRect()
+    const pointer = new THREE.Vector2(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    this.raycaster.setFromCamera(pointer, this.camera)
+  }
+
+  private objectAt(event: PointerEvent): THREE.Intersection | null {
+    if (!this.objectMeshes.length) return null
+    this.pointerRay(event)
+    return this.raycaster.intersectObjects(this.objectMeshes, false)[0] ?? null
+  }
+
+  private startObjectDrag(event: PointerEvent): void {
+    if (this.objectGizmoMode !== 'translate' || this.gizmo.axis || this.gizmo.dragging) return
+    const hit = this.objectAt(event)
+    if (!hit) return
+    const mesh = hit.object as THREE.Mesh
+    this.applySelection(mesh)
+    const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -hit.point.z)
+    this.objectDrag = { mesh, plane, offset: mesh.position.clone().sub(hit.point), start: mesh.position.clone(), moved: false }
+    this.controls.enabled = false
+  }
+
+  private dragObject(event: PointerEvent): void {
+    const drag = this.objectDrag
+    if (!drag || !event.buttons) return
+    this.pointerRay(event)
+    const point = this.raycaster.ray.intersectPlane(drag.plane, new THREE.Vector3())
+    if (!point) return
+    const target = point.add(drag.offset)
+    const snap = (value: number, origin: number): number => origin + Math.round((value - origin) * 2) / 2
+    drag.mesh.position.set(snap(target.x, drag.start.x), snap(target.y, drag.start.y), drag.start.z)
+    drag.moved = true
+    this.renderer.domElement.style.cursor = 'grabbing'
+  }
+
+  private finishObjectDrag = (): void => {
+    const drag = this.objectDrag
+    if (!drag) return
+    this.objectDrag = null
+    this.controls.enabled = this.mode !== 'draw'
+    if (drag.moved) this.reportMove(drag.mesh, drag.start)
+  }
+
   setPins(pins: ChatPin[]): void {
     this.pinsGroup.clear()
     const size = this.bounds().getSize(new THREE.Vector3()).length()
@@ -481,6 +845,7 @@ export class ModelViewer {
       sprite.center.set(0.5, 0)
       sprite.position.set(...pin.point)
       sprite.renderOrder = 20
+      sprite.userData.pinId = pin.id
       this.pinsGroup.add(sprite)
       const dot = new THREE.Mesh(new THREE.SphereGeometry(Math.max(size / 250, 0.12), 12, 8), new THREE.MeshBasicMaterial({ color: 0xff3b30, depthTest: false }))
       dot.position.set(...pin.point)
@@ -497,17 +862,43 @@ export class ModelViewer {
     return this.raycaster.intersectObject(this.mesh)[0] ?? null
   }
 
+  private pinAt(event: PointerEvent): number | null {
+    const markers = this.pinsGroup.children.filter((child) => child.userData.pinId !== undefined)
+    if (!markers.length) return null
+    const rect = this.renderer.domElement.getBoundingClientRect()
+    const pointer = new THREE.Vector2(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    this.raycaster.setFromCamera(pointer, this.camera)
+    const hit = this.raycaster.intersectObjects(markers, false)[0]
+    return hit ? (hit.object.userData.pinId as number) : null
+  }
+
   private handlePointerDown = (event: PointerEvent): void => {
     this.pointerDown = { x: event.clientX, y: event.clientY }
+    if (this.mode === 'move' && event.button === 0) this.startObjectDrag(event)
   }
 
   private handlePointerUp = (event: PointerEvent): void => {
     const start = this.pointerDown
     this.pointerDown = null
     if (!start || Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) return
+    if (event.button === 2) {
+      if (this.mode !== 'draw') this.onContextMenu?.(this.contextAt(event))
+      return
+    }
     if (this.gizmo.dragging || this.gizmo.axis) return
+    if (this.mode === 'move') {
+      if (!this.objectAt(event)) this.selectObject(null)
+      return
+    }
+    if (this.mode === 'orbit' || this.mode === 'pin') {
+      const pinId = this.pinAt(event)
+      if (pinId !== null) {
+        this.onPinRemove?.(pinId)
+        return
+      }
+    }
     if (this.mode === 'measure') this.measureClick(event)
-    if (this.mode === 'pin' || (this.mode === 'orbit' && this.clickToPin && !this.editing)) {
+    if (this.mode === 'pin') {
       const hit = this.hitModel(event)
       if (!hit) return
       const normal = hit.face ? hit.face.normal.clone().transformDirection(this.mesh!.matrixWorld) : new THREE.Vector3(0, 0, 1)
@@ -517,6 +908,18 @@ export class ModelViewer {
   }
 
   private handlePointerMove = (event: PointerEvent): void => {
+    if (this.mode === 'move') {
+      if (this.objectGizmoMode === 'translate') {
+        this.dragObject(event)
+        if (!event.buttons) this.renderer.domElement.style.cursor = this.objectAt(event) ? 'grab' : ''
+      }
+      return
+    }
+    if ((this.mode === 'orbit' || this.mode === 'pin') && !event.buttons) {
+      const overPin = this.pinAt(event) !== null
+      this.renderer.domElement.style.cursor = overPin ? 'pointer' : this.mode === 'pin' ? 'crosshair' : ''
+      this.renderer.domElement.title = overPin ? 'Click to remove this pin' : ''
+    }
     if (this.mode !== 'measure' || event.buttons) return
     cancelAnimationFrame(this.hoverFrame)
     const { clientX, clientY } = event
@@ -660,6 +1063,55 @@ export class ModelViewer {
     label.position.copy(start).add(end).multiplyScalar(0.5)
     this.measureGroup.add(label)
   }
+}
+
+const DEFAULT_MODEL_COLOR = new THREE.Color(0xf39200)
+
+export function parseScadColor(value: string): THREE.Color {
+  const trimmed = value.trim()
+  if (!trimmed) return DEFAULT_MODEL_COLOR.clone()
+  const vector = trimmed.match(/^\[([^\]]*)\]$/)
+  if (vector) {
+    const [r, g, b] = vector[1].split(',').map(Number)
+    if ([r, g, b].every(Number.isFinite)) return new THREE.Color().setRGB(r, g, b, THREE.SRGBColorSpace)
+    return DEFAULT_MODEL_COLOR.clone()
+  }
+  const hex = trimmed.match(/^#([0-9a-f]{3,8})$/i)
+  if (hex) {
+    const digits = hex[1].length === 4 || hex[1].length === 8 ? hex[1].slice(0, hex[1].length * 0.75) : hex[1]
+    return new THREE.Color(`#${digits}`)
+  }
+  const named = trimmed.toLowerCase()
+  if (named in THREE.Color.NAMES) return new THREE.Color(named as keyof typeof THREE.Color.NAMES)
+  return DEFAULT_MODEL_COLOR.clone()
+}
+
+function mergeColorParts(parts: ColorPart[]): THREE.BufferGeometry {
+  const loader = new STLLoader()
+  const loaded = parts.map((part) => {
+    const buffer = part.stl.buffer.slice(part.stl.byteOffset, part.stl.byteOffset + part.stl.byteLength) as ArrayBuffer
+    return { color: parseScadColor(part.color), positions: loader.parse(buffer).getAttribute('position') }
+  })
+  const total = loaded.reduce((count, part) => count + part.positions.count, 0)
+  const positions = new Float32Array(total * 3)
+  const colors = new Float32Array(total * 3)
+  let offset = 0
+  for (const part of loaded) {
+    positions.set(part.positions.array as Float32Array, offset * 3)
+    for (let index = 0; index < part.positions.count; index++) part.color.toArray(colors, (offset + index) * 3)
+    offset += part.positions.count
+  }
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+  geometry.computeVertexNormals()
+  let start = 0
+  geometry.userData.colorRanges = loaded.map((part, index) => {
+    const range = { start, end: start + part.positions.count, color: parts[index].color }
+    start = range.end
+    return range
+  })
+  return geometry
 }
 
 function parallelFaceGap(first: MeasurePoint, second: MeasurePoint): number | null {

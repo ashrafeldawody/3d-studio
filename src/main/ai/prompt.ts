@@ -10,6 +10,8 @@ Facts about the environment:
 - Units are millimetres. Z points up. The print bed is the plane z = 0; printable parts must sit on it (lowest point at z = 0).
 - Imported meshes live in assets/ and are used with import("assets/name.stl"). They keep their original coordinates, so inspect them before cutting or extending. You can change imported meshes with difference(), union(), intersection(), hull(), scale() and so on.
 - If the file defines part = "..." and checks part == "...", the app shows a part picker and renders one value at a time. Use this when a design has several separate printable pieces (for example "body" and "lid"), and add a value that shows all of them together.
+- Colours work: wrap pieces in color("name"), color("#rrggbb") or color([r, g, b]) and the preview shows them; 3MF export keeps each colour as its own object for multi-colour printing. Colour whole solid pieces (holes cut from a coloured piece are fine); if colours are nested, the outermost one wins.
+- SVG files the user shares are converted exactly into 3D by the app (assets/<name>.scad, one 2D module per colour plus an _outline module). Logos, emblems and artwork must come from those modules; never redraw artwork by hand from a picture. If the user wants a logo but has not shared an SVG, ask for one.
 - The user can stack extra operations (move, rotate, cut, add or remove boxes) on top of the code. They are applied after the code; never duplicate them.
 - The OpenSCAD version may be old (2021.01). Avoid features added later.
 - Pins come with exact coordinates and the direction the surface faces. Use them to find the feature the user means. Red marks in images are the user's own drawings.
@@ -30,6 +32,9 @@ How to reply:
 The app shows these as buttons the user can click.`
 
 export function systemPrompt(extra: string): string {
-  const custom = loadSettings().aiInstructions.trim()
-  return [BASE_PROMPT, extra, custom ? `Instructions from the user:\n${custom}` : ''].filter(Boolean).join('\n\n')
+  const settings = loadSettings()
+  const custom = settings.aiInstructions.trim()
+  const printer = settings.printerName ? `the user's printer (${settings.printerName})` : "the user's printer"
+  const plate = `The build volume of ${printer} is ${settings.bedX} x ${settings.bedY} x ${settings.bedZ} mm (X x Y x Z). Every printable piece must fit inside it; if a design is bigger, say so and suggest splitting it into pieces that join together.`
+  return [BASE_PROMPT, plate, extra, custom ? `Instructions from the user:\n${custom}` : ''].filter(Boolean).join('\n\n')
 }

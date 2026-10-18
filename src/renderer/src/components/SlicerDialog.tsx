@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { SlicerFilament, SlicerObject, SlicerPresetList } from '@shared/types'
+import type { SlicerApp, SlicerFilament, SlicerObject, SlicerPresetList } from '@shared/types'
+import { SLICER_APP_LABEL } from '@shared/types'
 
 interface Props {
+  app: SlicerApp
   projectName: string
   parts: string[]
   currentPart: string
@@ -25,12 +27,63 @@ interface Preferences {
   brim: boolean
 }
 
-function loadPreferences(): Preferences | null {
+function loadPreferences(app: SlicerApp): Preferences | null {
   try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
+    const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
+    if (!raw) return null
+    if (raw.byApp?.[app]) return raw.byApp[app]
+    if (app === 'snapmaker' && typeof raw.printer === 'string') return raw
+    return null
   } catch {
     return null
   }
+}
+
+function savePreferences(app: SlicerApp, preferences: Preferences): void {
+  let raw: { byApp?: Partial<Record<SlicerApp, Preferences>> } = {}
+  try {
+    raw = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') ?? {}
+  } catch {
+    raw = {}
+  }
+  const byApp = raw.byApp ?? {}
+  byApp[app] = preferences
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ byApp }))
+}
+
+function preferredPrinter(app: SlicerApp, printers: string[]): string {
+  const pattern: Record<SlicerApp, RegExp> = {
+    bambu: /H2D|X1 Carbon|X1C|P1S|A1 mini|\bA1\b|Bambu/i,
+    snapmaker: /U1|Artisan|Snapmaker/i,
+    orca: /./
+  }
+  return printers.find((name) => pattern[app].test(name)) ?? printers[0] ?? ''
+}
+
+function printerModel(printer: string): string | null {
+  return printer.match(/\b(A1 mini|A1|P1S|P1P|X1 Carbon|X1C|X1E|X1|H2D|H2S|H2C|U1|J1s|J1|Artisan)\b/i)?.[1] ?? null
+}
+
+function matchingProcesses(printer: string, processes: string[]): string[] {
+  const nozzle = printer.match(/(\d+\.\d+)\s*nozzle/i)?.[1]
+  const model = printerModel(printer)
+  const matched = processes.filter((name) => {
+    const nozzleOk = !nozzle || name.includes(nozzle)
+    const modelOk = !model || name.toLowerCase().includes(model.toLowerCase())
+    return nozzleOk && modelOk
+  })
+  return matched.length ? matched : processes
+}
+
+function matchingFilaments(printer: string, filaments: string[]): string[] {
+  const model = printerModel(printer)
+  const brand = printer.split(' ')[0]
+  if (model) {
+    const exact = filaments.filter((name) => name.includes(`@${model}`) || name.includes(`@${brand} ${model}`))
+    if (exact.length) return exact
+  }
+  const branded = filaments.filter((name) => name.includes(`@${brand}`))
+  return branded.length ? branded : filaments
 }
 
 function PresetSelect({ value, options, onChange }: { value: string; options: string[]; onChange(value: string): void }) {
@@ -46,9 +99,9 @@ function PresetSelect({ value, options, onChange }: { value: string; options: st
   )
 }
 
-export function SlicerDialog({ projectName, parts, currentPart, onExport, onClose }: Props) {
+export function SlicerDialog({ app, projectName, parts, currentPart, onExport, onClose }: Props) {
   const [presets, setPresets] = useState<SlicerPresetList | null>(null)
-  const saved = loadPreferences()
+  const saved = loadPreferences(app)
   const [printer, setPrinter] = useState(saved?.printer ?? '')
   const [process, setProcess] = useState(saved?.process ?? '')
   const [filaments, setFilaments] = useState<SlicerFilament[]>(saved?.filaments ?? [{ preset: '', colour: '#161616' }])
@@ -62,26 +115,15 @@ export function SlicerDialog({ projectName, parts, currentPart, onExport, onClos
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    window.studio.slicer.presets().then((list) => {
+    window.studio.slicer.presets(app).then((list) => {
       setPresets(list)
-      if (!printer && list.printers.length) setPrinter(list.printers.find((name) => /U1/.test(name)) ?? list.printers[0])
+      setPrinter((current) => (current && list.printers.includes(current) ? current : preferredPrinter(app, list.printers)))
     })
-  }, [])
+  }, [app])
 
-  const processes = useMemo(() => {
-    if (!presets) return []
-    const key = printer.replace(/^.*?(\S+ \(\d\.\d nozzle\)).*$/, '$1')
-    const matching = presets.processes.filter((name) => name.includes(key))
-    return matching.length ? matching : presets.processes
-  }, [presets, printer])
+  const processes = useMemo(() => (presets ? matchingProcesses(printer, presets.processes) : []), [presets, printer])
 
-  const filamentOptions = useMemo(() => {
-    if (!presets) return []
-    const brand = printer.split(' ')[0]
-    const model = printer.match(/\b([A-Z]\d+)\b/)?.[1]
-    const matching = presets.filaments.filter((name) => (model ? name.includes(`@${model}`) || name.includes(`@${brand} ${model}`) : true))
-    return matching.length ? matching : presets.filaments
-  }, [presets, printer])
+  const filamentOptions = useMemo(() => (presets ? matchingFilaments(printer, presets.filaments) : []), [presets, printer])
 
   useEffect(() => {
     if (processes.length && !processes.includes(process)) setProcess(processes.find((name) => name.includes('0.20mm Standard')) ?? processes[0])
@@ -99,7 +141,7 @@ export function SlicerDialog({ projectName, parts, currentPart, onExport, onClos
   const submit = async (): Promise<void> => {
     setBusy(true)
     setError(null)
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ printer, process, filaments, infill, brim }))
+    savePreferences(app, { printer, process, filaments, infill, brim })
     const settings: Record<string, string> = { enable_prime_tower: '0', sparse_infill_density: infill }
     if (brim) {
       settings.brim_type = 'outer_only'
@@ -119,8 +161,11 @@ export function SlicerDialog({ projectName, parts, currentPart, onExport, onClos
     return (
       <div className="modal-backdrop" onMouseDown={onClose}>
         <div className="modal" onMouseDown={(event) => event.stopPropagation()}>
-          <h2>Slicer project</h2>
-          <p>No Snapmaker Orca or OrcaSlicer installation was found. Install one of them, or export a plain 3MF instead.</p>
+          <h2>{SLICER_APP_LABEL[app]} project</h2>
+          <p>
+            No presets for {SLICER_APP_LABEL[app]} were found. Install it and open it once so its printer profiles are on this computer.
+            {presets.installed.length ? ` Already installed: ${presets.installed.map((item) => SLICER_APP_LABEL[item]).join(', ')}.` : ''} STL and 3MF still open in any slicer.
+          </p>
           <div className="modal-actions">
             <button onClick={onClose}>Close</button>
           </div>
@@ -132,10 +177,15 @@ export function SlicerDialog({ projectName, parts, currentPart, onExport, onClos
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div className="modal wide" onMouseDown={(event) => event.stopPropagation()}>
-        <h2>Export slicer project (Snapmaker Orca / OrcaSlicer)</h2>
+        <h2>{SLICER_APP_LABEL[app]} project</h2>
         {!presets && <p>Loading presets...</p>}
         {presets && (
           <>
+            {presets.source && presets.source !== app && (
+              <p className="hint">
+                {SLICER_APP_LABEL[app]} is not installed. These presets come from {SLICER_APP_LABEL[presets.source]}. Pick the {SLICER_APP_LABEL[app]} printer if it is in the list, or export STL / 3MF for any slicer.
+              </p>
+            )}
             <label className="field">
               <span>Printer</span>
               <PresetSelect value={printer} options={presets.printers} onChange={setPrinter} />

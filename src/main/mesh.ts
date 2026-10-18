@@ -7,6 +7,7 @@ export type Triangle = [Vec3, Vec3, Vec3]
 export interface NamedMesh {
   name: string
   triangles: Triangle[]
+  color?: string
 }
 
 export function readStl(data: Uint8Array): Triangle[] {
@@ -150,8 +151,29 @@ function apply(matrix: Matrix, [x, y, z]: Vec3): Vec3 {
 
 interface ModelObject {
   name: string
+  color?: string
   mesh?: { vertices: Vec3[]; triangles: [number, number, number][] }
   components: { path: string; id: string; transform: Matrix }[]
+}
+
+function normaliseColor(value: string | undefined): string | undefined {
+  const match = value?.trim().match(/^#([0-9a-f]{6})([0-9a-f]{2})?$/i)
+  return match ? `#${match[1].toLowerCase()}` : undefined
+}
+
+function readColorGroups(xml: string): Map<string, (string | undefined)[]> {
+  const groups = new Map<string, (string | undefined)[]>()
+  const groupPattern = /<(?:\w+:)?(basematerials|colorgroup)\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?\1>/g
+  for (const match of xml.matchAll(groupPattern)) {
+    const id = attributes(match[2]).id
+    const entryPattern = match[1] === 'basematerials' ? /<(?:\w+:)?base\b([^>]*)\/?>/g : /<(?:\w+:)?color\b([^>]*)\/?>/g
+    const colors = [...match[3].matchAll(entryPattern)].map((entry) => {
+      const a = attributes(entry[1])
+      return normaliseColor(a.displaycolor ?? a.color)
+    })
+    if (id) groups.set(id, colors)
+  }
+  return groups
 }
 
 function attributes(tag: string): Record<string, string> {
@@ -161,11 +183,14 @@ function attributes(tag: string): Record<string, string> {
 }
 
 function parseModelFile(xml: string, path: string, objects: Map<string, ModelObject>): { id: string; transform: Matrix }[] {
+  const colorGroups = readColorGroups(xml)
+  const colorOf = (pid: string | undefined, index: string | undefined): string | undefined =>
+    pid ? colorGroups.get(pid)?.[Number(index ?? 0)] : undefined
   const objectPattern = /<object\b([^>]*)>([\s\S]*?)<\/object>/g
   for (const match of xml.matchAll(objectPattern)) {
     const attrs = attributes(match[1])
     const body = match[2]
-    const object: ModelObject = { name: attrs.name ?? `object ${attrs.id}`, components: [] }
+    const object: ModelObject = { name: attrs.name ?? `object ${attrs.id}`, color: colorOf(attrs.pid, attrs.pindex), components: [] }
     const meshMatch = body.match(/<mesh\b[\s\S]*?<\/mesh>/)
     if (meshMatch) {
       const vertices: Vec3[] = []
@@ -174,10 +199,13 @@ function parseModelFile(xml: string, path: string, objects: Map<string, ModelObj
         vertices.push([Number(a.x), Number(a.y), Number(a.z)])
       }
       const triangles: [number, number, number][] = []
+      const triangleColors = new Set<string | undefined>()
       for (const triangle of meshMatch[0].matchAll(/<triangle\b([^>]*)\/?>/g)) {
         const a = attributes(triangle[1])
         triangles.push([Number(a.v1), Number(a.v2), Number(a.v3)])
+        if (!object.color && (a.pid || a.p1)) triangleColors.add(colorOf(a.pid ?? attrs.pid, a.p1))
       }
+      if (triangleColors.size === 1) object.color = [...triangleColors][0]
       object.mesh = { vertices, triangles }
     }
     for (const component of body.matchAll(/<component\b([^>]*)\/?>/g)) {
@@ -201,25 +229,90 @@ function parseModelFile(xml: string, path: string, objects: Map<string, ModelObj
 
 const normalisePath = (path: string): string => path.replace(/^\//, '')
 
+type ColorBuckets = Map<string, Triangle[]>
+
+function addTriangles(buckets: ColorBuckets, color: string, triangles: Triangle[]): void {
+  const bucket = buckets.get(color)
+  if (bucket) bucket.push(...triangles)
+  else buckets.set(color, triangles)
+}
+
 function collectTriangles(
   objects: Map<string, ModelObject>,
   path: string,
   id: string,
   transform: Matrix,
-  output: Triangle[],
+  inheritedColor: string,
+  output: ColorBuckets,
   depth = 0
 ): void {
   const object = objects.get(`${path}#${id}`)
   if (!object || depth > 16) return
+  const color = object.color ?? inheritedColor
   if (object.mesh) {
     const points = object.mesh.vertices.map((vertex) => apply(transform, vertex))
+    const triangles: Triangle[] = []
     for (const [a, b, c] of object.mesh.triangles) {
-      if (points[a] && points[b] && points[c]) output.push([points[a], points[b], points[c]])
+      if (points[a] && points[b] && points[c]) triangles.push([points[a], points[b], points[c]])
     }
+    addTriangles(output, color, triangles)
   }
   for (const component of object.components) {
-    collectTriangles(objects, component.path, component.id, multiply(transform, component.transform), output, depth + 1)
+    collectTriangles(objects, component.path, component.id, multiply(transform, component.transform), color, output, depth + 1)
   }
+}
+
+interface SlicerSettings {
+  names: Map<string, string>
+  objectExtruders: Map<string, number>
+  partExtruders: Map<string, number>
+  hiddenParts: Set<string>
+  filamentColors: string[]
+}
+
+const extruderIn = (xml: string): number | undefined => {
+  const match = xml.match(/key="extruder"\s+value="(\d+)"/)
+  return match ? Number(match[1]) : undefined
+}
+
+function readSlicerSettings(files: Record<string, Uint8Array>): SlicerSettings {
+  const settings: SlicerSettings = { names: new Map(), objectExtruders: new Map(), partExtruders: new Map(), hiddenParts: new Set(), filamentColors: [] }
+  for (const configName of ['Metadata/Slic3r_PE_model.config', 'Metadata/model_settings.config']) {
+    if (!files[configName]) continue
+    for (const match of strFromU8(files[configName]).matchAll(/<object\s+id="(\d+)"[^>]*>([\s\S]*?)<\/object>/g)) {
+      const [, objectId, body] = match
+      const ownSettings = body.split(/<(?:part|volume)\b/)[0]
+      const name = ownSettings.match(/key="name"\s+value="([^"]*)"/) ?? body.match(/key="name"\s+value="([^"]*)"/)
+      if (name && !settings.names.has(objectId)) settings.names.set(objectId, name[1])
+      const objectExtruder = extruderIn(ownSettings)
+      if (objectExtruder !== undefined) settings.objectExtruders.set(objectId, objectExtruder)
+      for (const part of body.matchAll(/<part\b([^>]*)>([\s\S]*?)<\/part>/g)) {
+        const attrs = attributes(part[1])
+        const key = `${objectId}:${attrs.id}`
+        if (attrs.subtype && attrs.subtype !== 'normal_part') settings.hiddenParts.add(key)
+        const partExtruder = extruderIn(part[2])
+        if (partExtruder !== undefined) settings.partExtruders.set(key, partExtruder)
+      }
+    }
+  }
+  const projectSettings = files['Metadata/project_settings.config']
+  if (projectSettings) {
+    try {
+      const parsed = JSON.parse(strFromU8(projectSettings)) as { filament_colour?: string[] }
+      settings.filamentColors = (parsed.filament_colour ?? []).map((color) => normaliseColor(color) ?? '')
+    } catch {
+      settings.filamentColors = []
+    }
+  }
+  const prusaSettings = files['Metadata/Slic3r_PE.config']
+  if (prusaSettings && !settings.filamentColors.length) {
+    const text = strFromU8(prusaSettings)
+    const colorsFor = (key: string): string[] =>
+      (text.match(new RegExp(`^; ${key} = (.*)$`, 'm'))?.[1] ?? '').split(';').map((value) => normaliseColor(value.replace(/"/g, '')) ?? '')
+    const extruderColors = colorsFor('extruder_colour')
+    settings.filamentColors = extruderColors.some(Boolean) ? extruderColors : colorsFor('filament_colour')
+  }
+  return settings
 }
 
 export function read3mf(data: Uint8Array): NamedMesh[] {
@@ -233,30 +326,39 @@ export function read3mf(data: Uint8Array): NamedMesh[] {
     if (path === rootPath) rootItems = items
   }
   if (!rootPath) return []
-  const slicerNames = new Map<string, string>()
-  for (const configName of ['Metadata/Slic3r_PE_model.config', 'Metadata/model_settings.config']) {
-    if (!files[configName]) continue
-    for (const match of strFromU8(files[configName]).matchAll(/<object\s+id="(\d+)"[^>]*>([\s\S]*?)<\/object>/g)) {
-      const name = match[2].match(/key="name"\s+value="([^"]*)"/)
-      if (name && !slicerNames.has(match[1])) slicerNames.set(match[1], name[1])
-    }
-  }
+  const slicer = readSlicerSettings(files)
   for (const [key, object] of objects) {
     const id = key.split('#')[1]
-    if (object.name.startsWith('object ') && slicerNames.has(id)) object.name = slicerNames.get(id)!
+    if (object.name.startsWith('object ') && slicer.names.has(id)) object.name = slicer.names.get(id)!
   }
+  const filamentColor = (extruder: number | undefined): string | undefined =>
+    extruder === undefined ? undefined : slicer.filamentColors[Math.max(extruder, 1) - 1] || undefined
   const meshes: NamedMesh[] = []
   const usedNames = new Set<string>()
-  rootItems.forEach((item, index) => {
-    const triangles: Triangle[] = []
-    collectTriangles(objects, rootPath!, item.id, item.transform, triangles)
-    if (!triangles.length) return
-    const baseName = objects.get(`${rootPath}#${item.id}`)?.name ?? `part ${index + 1}`
+  const uniqueName = (baseName: string): string => {
     let name = safeName(baseName)
     let suffix = 2
     while (usedNames.has(name)) name = `${safeName(baseName)}-${suffix++}`
     usedNames.add(name)
-    meshes.push({ name, triangles })
+    return name
+  }
+  rootItems.forEach((item, index) => {
+    const root = objects.get(`${rootPath}#${item.id}`)
+    if (!root) return
+    const configured = slicer.names.has(item.id)
+    const rootColor = filamentColor(slicer.objectExtruders.get(item.id) ?? (configured ? 1 : undefined)) ?? root.color ?? ''
+    const buckets: ColorBuckets = new Map()
+    if (root.mesh) collectTriangles(objects, rootPath!, item.id, item.transform, rootColor, buckets)
+    for (const component of root.mesh ? [] : root.components) {
+      const partKey = `${item.id}:${component.id}`
+      if (slicer.hiddenParts.has(partKey)) continue
+      const partColor = filamentColor(slicer.partExtruders.get(partKey)) ?? rootColor
+      collectTriangles(objects, component.path, component.id, multiply(item.transform, component.transform), partColor, buckets, 1)
+    }
+    const baseName = root.name ?? `part ${index + 1}`
+    for (const [color, triangles] of buckets) {
+      if (triangles.length) meshes.push({ name: uniqueName(baseName), triangles, color: color || undefined })
+    }
   })
   return meshes
 }

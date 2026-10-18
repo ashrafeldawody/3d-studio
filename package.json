@@ -49,6 +49,23 @@
     "win": {
       "target": "nsis",
       "icon": "resources/icon.ico"
-    }
+    },
+    "fileAssociations": [
+      {
+        "ext": "3mf",
+        "name": "3MF model",
+        "role": "Editor"
+      },
+      {
+        "ext": "stl",
+        "name": "STL model",
+        "role": "Editor"
+      },
+      {
+        "ext": "scad",
+        "name": "OpenSCAD model",
+        "role": "Editor"
+      }
+    ]
   }
 }

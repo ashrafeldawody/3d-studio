@@ -1,11 +1,12 @@
-import { mkdirSync, writeFileSync } from 'fs'
-import { join } from 'path'
-import type { ChatAttachments, ChatEvent, ChatMessage, ChatPin, Operation, RenderResult, ViewName } from '@shared/types'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { basename, extname, join, relative as relativePath } from 'path'
+import type { ChatAttachments, ChatEvent, ChatFile, ChatImage, ChatMessage, ChatPin, Operation, RenderResult, ViewName } from '@shared/types'
 import { renderModel, summariseRender } from '../openscad'
-import { loadChat, readCode, saveChat, snapshot, studioDir, writeCode } from '../project'
+import { importArtwork, importMeshFile, loadChat, readCode, saveChat, snapshot, studioDir, writeCode } from '../project'
 import { loadSettings } from '../settings'
 import { AiRunContext } from './context'
 import { runClaudeCode } from './claudeCode'
+import { runCliAgent } from './cliAgents'
 import { ApiMessage, runOpenRouter } from './openrouter'
 
 export interface ChatHost {
@@ -66,7 +67,10 @@ export async function sendChat(
   const { images, pins } = request.attachments
   const pinText = describePins(pins)
   const fullPrompt = pinText ? `${request.prompt}\n\n${pinText}` : request.prompt
-  addMessage('user', fullPrompt, images.map((image) => image.thumbnail))
+  const attachedNames = (request.attachments.files ?? []).map((file) => `📎 ${file.name}`).join('\n')
+  addMessage('user', attachedNames ? `${fullPrompt}\n\n${attachedNames}` : fullPrompt, images.map((image) => image.thumbnail))
+  const artworkNotes = importAttachedArtwork(request.dir, images, context.writeCode, addMessage)
+  const fileNotes = shareAttachedFiles(request.dir, request.attachments.files ?? [], settings.aiProvider === 'openrouter', addMessage)
   host.emit({ type: 'busy', busy: true })
   try {
     const labelled = images.map((image) => ({ label: image.name, dataUrl: image.dataUrl }))
@@ -74,12 +78,19 @@ export async function sendChat(
       const view = await host.captureView('iso')
       if (view) labelled.push({ label: 'Current preview (3D view)', dataUrl: view })
     }
-    let prompt = fullPrompt
+    let prompt = [fullPrompt, ...artworkNotes, fileNotes].filter(Boolean).join('\n\n')
     for (let round = 0; round <= MAX_AUTO_FIX_ROUNDS; round++) {
-      if (settings.aiProvider === 'claude-code') {
+      const provider = settings.aiProvider
+      if (provider === 'claude-code') {
         const imagePaths = round === 0 ? saveAttachmentImages(request.dir, labelled) : []
         const result = await runClaudeCode(context, prompt, store.claudeSessionId, imagePaths)
         store.claudeSessionId = result.sessionId
+        saveChat(request.dir, store)
+        if (result.isError) break
+      } else if (provider === 'codex' || provider === 'grok' || provider === 'agy') {
+        const imagePaths = round === 0 ? saveAttachmentImages(request.dir, labelled) : []
+        const result = await runCliAgent(provider, context, prompt, store.agentSessions?.[provider], imagePaths)
+        store.agentSessions = { ...store.agentSessions, [provider]: result.sessionId }
         saveChat(request.dir, store)
         if (result.isError) break
       } else {
@@ -111,6 +122,76 @@ export async function sendChat(
     }
     host.emit({ type: 'busy', busy: false })
   }
+}
+
+const TEXT_EXTENSIONS = /\.(txt|md|csv|json|scad|svg|xml|yaml|yml|ini|cfg|conf|log|gcode|py|js|ts|html|css|dxf|obj)$/i
+const INLINE_LIMIT = 150_000
+
+function shareAttachedFiles(dir: string, files: ChatFile[], inlineText: boolean, addMessage: (role: ChatMessage['role'], text: string) => ChatMessage): string {
+  if (!files.length) return ''
+  const folder = join(studioDir(dir), 'attachments', 'files')
+  mkdirSync(folder, { recursive: true })
+  const lines: string[] = []
+  const inlined: string[] = []
+  for (const file of files) {
+    try {
+      const extension = extname(file.name).toLowerCase()
+      if ((extension === '.stl' || extension === '.3mf') && file.path) {
+        const meshes = importMeshFile(dir, file.path)
+        lines.push(`- ${file.name}: a 3D model, copied into the project as ${meshes.map((mesh) => mesh.file).join(', ')}. Use it with import("${meshes[0].file}") if it should become part of the design.`)
+        continue
+      }
+      const target = join(folder, uniqueFileName(folder, basename(file.name)))
+      if (file.path) copyFileSync(file.path, target)
+      else if (file.data) writeFileSync(target, Buffer.from(file.data))
+      else continue
+      const relative = relativePath(dir, target).replace(/\\/g, '/')
+      lines.push(`- ${file.name} (${formatSize(file.size)}): ${relative}`)
+      if (inlineText && TEXT_EXTENSIONS.test(file.name) && file.size <= INLINE_LIMIT) inlined.push(`<file name="${file.name}">\n${readFileSync(target, 'utf8')}\n</file>`)
+    } catch (error) {
+      addMessage('error', `Could not attach ${file.name}: ${(error as Error).message}`)
+    }
+  }
+  if (!lines.length) return ''
+  const intro = inlineText
+    ? 'The user shared these files (saved in the project folder; text files are included below):'
+    : 'The user shared these files. They are saved in the project folder; open them with your file tools when they are relevant:'
+  return [intro, ...lines, ...inlined].join('\n')
+}
+
+function uniqueFileName(folder: string, name: string): string {
+  const extension = extname(name)
+  const stem = name.slice(0, name.length - extension.length) || 'file'
+  let candidate = name
+  let suffix = 2
+  while (existsSync(join(folder, candidate))) candidate = `${stem}-${suffix++}${extension}`
+  return candidate
+}
+
+const formatSize = (bytes: number): string =>
+  bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} bytes`
+
+function importAttachedArtwork(
+  dir: string,
+  images: ChatImage[],
+  writeModel: (code: string) => void,
+  addMessage: (role: ChatMessage['role'], text: string) => ChatMessage
+): string[] {
+  const notes: string[] = []
+  for (const image of images) {
+    if (!image.artwork) continue
+    try {
+      const imported = importArtwork(dir, image.artwork)
+      const current = readCode(dir).trimEnd()
+      writeModel(current ? `${current}\n\n${imported.code}` : imported.code)
+      notes.push(imported.summary)
+      const warnings = image.artwork.warnings.length ? `\n${image.artwork.warnings.join('\n')}` : ''
+      addMessage('info', `Added ${image.artwork.fileName} exactly as drawn, in ${image.artwork.colors.length} colour${image.artwork.colors.length === 1 ? '' : 's'}.${warnings}`)
+    } catch (error) {
+      addMessage('error', `Could not convert ${image.artwork.fileName}: ${(error as Error).message}`)
+    }
+  }
+  return notes
 }
 
 function describePins(pins: ChatPin[]): string {

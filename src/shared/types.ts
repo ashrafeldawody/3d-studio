@@ -23,9 +23,15 @@ export interface MeshStats {
   nonManifoldEdges: number
 }
 
+export interface ColorPart {
+  color: string
+  stl: Uint8Array
+}
+
 export interface RenderResult {
   ok: boolean
   stl?: Uint8Array
+  parts?: ColorPart[]
   stats?: MeshStats
   log: string
   errors: RenderMessage[]
@@ -56,7 +62,9 @@ export interface ProjectState {
   history: HistoryEntry[]
 }
 
-export type AiProvider = 'openrouter' | 'claude-code'
+export type CliAgent = 'codex' | 'grok' | 'agy'
+
+export type AiProvider = 'openrouter' | 'claude-code' | CliAgent
 
 export type ClaudeEffort = '' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
@@ -66,6 +74,12 @@ export interface Settings {
   claudeModel: string
   claudeEffort: ClaudeEffort
   claudeAllowBash: boolean
+  codexPath: string
+  codexModel: string
+  grokPath: string
+  grokModel: string
+  agyPath: string
+  agyModel: string
   openrouterApiKey: string
   openrouterModel: string
   aiProvider: AiProvider
@@ -76,6 +90,8 @@ export interface Settings {
   uiMode: 'simple' | 'expert'
   bedX: number
   bedY: number
+  bedZ: number
+  printerName: string
   recentProjects: string[]
 }
 
@@ -101,7 +117,18 @@ export interface OpenRouterModel {
   tools: boolean
 }
 
+export type SlicerApp = 'bambu' | 'snapmaker' | 'orca'
+
+export const SLICER_APP_LABEL: Record<SlicerApp, string> = {
+  bambu: 'Bambu Studio',
+  snapmaker: 'Snapmaker Orca',
+  orca: 'OrcaSlicer'
+}
+
 export interface SlicerPresetList {
+  app: SlicerApp
+  source: SlicerApp | null
+  installed: SlicerApp[]
   printers: string[]
   processes: string[]
   filaments: string[]
@@ -123,6 +150,7 @@ export interface SlicerObject {
 export interface SlicerExportRequest {
   outputPath: string
   title: string
+  app: SlicerApp
   printer: string
   process: string
   filaments: SlicerFilament[]
@@ -132,6 +160,23 @@ export interface SlicerExportRequest {
 
 export type ViewName = 'iso' | 'top' | 'front' | 'right' | 'back' | 'left' | 'bottom'
 
+export type MenuCommand =
+  | { type: 'newProject' }
+  | { type: 'openProject' }
+  | { type: 'openFile' }
+  | { type: 'openRecent'; dir: string }
+  | { type: 'clearRecent' }
+  | { type: 'importModels' }
+  | { type: 'save' }
+  | { type: 'export'; format: 'stl' | '3mf' }
+  | { type: 'slicer'; app: SlicerApp }
+  | { type: 'closeProject' }
+  | { type: 'settings' }
+  | { type: 'undo' }
+  | { type: 'render' }
+  | { type: 'view'; view: ViewName }
+  | { type: 'uiMode'; mode: Settings['uiMode'] }
+
 export interface ChatPin {
   id: number
   point: Vector3
@@ -140,8 +185,9 @@ export interface ChatPin {
 }
 
 export interface ChatAttachments {
-  images: { name: string; dataUrl: string; thumbnail: string }[]
+  images: ChatImage[]
   pins: ChatPin[]
+  files?: ChatFile[]
 }
 
 export interface ModelParameter {
@@ -151,4 +197,33 @@ export interface ModelParameter {
   start: number
   end: number
   line: number
+}
+
+export interface VectorArtwork {
+  fileName: string
+  library: string
+  colors: { color: string; module: string }[]
+  width: number
+  height: number
+  warnings: string[]
+}
+
+export interface ChatImage {
+  name: string
+  dataUrl: string
+  thumbnail: string
+  artwork?: VectorArtwork
+}
+
+export interface RenderedObject {
+  index: number
+  label: string
+  parts: ColorPart[]
+}
+
+export interface ChatFile {
+  name: string
+  size: number
+  path?: string
+  data?: Uint8Array
 }

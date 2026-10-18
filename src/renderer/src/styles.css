@@ -513,6 +513,7 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  z-index: 3;
 }
 
 .model-dropdown {
@@ -871,10 +872,53 @@ textarea {
   display: flex;
   gap: 6px;
   align-items: center;
+  flex-wrap: wrap;
+  max-width: calc(100% - 20px);
   background: rgba(28, 31, 36, 0.92);
   border: 1px solid var(--accent);
   border-radius: 8px;
   padding: 6px 8px;
+}
+
+.object-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.object-panel h3 {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.object-card .pane-title {
+  padding: 0 0 4px;
+  border: none;
+}
+
+.part-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.part-list button {
+  text-align: left;
+}
+
+.part-list button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.viewer-shapes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: center;
+  margin-top: 8px;
+  pointer-events: auto;
 }
 
 .viewer-edit span {
@@ -913,6 +957,7 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  z-index: 3;
 }
 
 .param-row input[type='range'] {
@@ -1224,6 +1269,7 @@ textarea {
 .ai-viewer-step {
   overflow: hidden;
   white-space: nowrap;
+  z-index: 3;
   text-overflow: ellipsis;
   animation: ai-step-in 0.3s ease-out;
 }
@@ -1350,7 +1396,9 @@ textarea {
   font-size: 12px;
   z-index: 3;
   pointer-events: none;
-  white-space: nowrap;
+  white-space: normal;
+  text-align: center;
+  max-width: min(640px, calc(100% - 24px));
 }
 
 .viewer-problem {
@@ -1367,6 +1415,9 @@ textarea {
   padding: 8px 12px;
   border-radius: 8px;
   z-index: 4;
+  max-width: min(720px, calc(100% - 24px));
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 .quick-actions {
@@ -1502,4 +1553,261 @@ button.big {
   margin-top: 20px;
   padding-top: 14px;
   border-top: 1px solid var(--border);
+}
+
+.viewer-fit {
+  position: absolute;
+  top: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(60, 30, 20, 0.92);
+  border: 1px solid #e5534b;
+  color: #ffb4ac;
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  pointer-events: auto;
+  white-space: nowrap;
+  z-index: 3;
+}
+
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(21, 23, 26, 0.72);
+  border: 3px dashed var(--accent);
+  pointer-events: none;
+}
+
+.drop-overlay > div {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 22px 34px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+.drop-overlay strong {
+  font-size: 20px;
+  color: var(--accent);
+}
+
+.drop-overlay span {
+  color: var(--muted);
+}
+
+.ctx-menu {
+  position: absolute;
+  z-index: 50;
+  min-width: 230px;
+  padding: 4px;
+  background: #23272e;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  user-select: none;
+}
+
+.ctx-sub {
+  top: -4px;
+  left: 100%;
+  margin-left: 2px;
+}
+
+.ctx-sub.flip {
+  left: auto;
+  right: 100%;
+  margin-left: 0;
+  margin-right: 2px;
+}
+
+.ctx-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px 4px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.ctx-header-note {
+  margin-left: auto;
+  font-weight: 400;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: none;
+}
+
+.ctx-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ctx-item:hover:not(:disabled):not(.disabled) {
+  background: #2f3540;
+}
+
+.ctx-item:disabled,
+.ctx-item.disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.ctx-item.danger {
+  color: #ff8a80;
+}
+
+.ctx-icon {
+  width: 18px;
+  display: inline-flex;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.ctx-label {
+  flex: 1;
+}
+
+.ctx-hint,
+.ctx-arrow {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.ctx-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
+}
+
+.ctx-dot {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  flex-shrink: 0;
+}
+
+.ctx-palette {
+  padding: 6px;
+  width: 212px;
+}
+
+.ctx-swatches {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 6px;
+}
+
+.ctx-swatch {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  cursor: pointer;
+}
+
+.ctx-swatch:hover,
+.ctx-swatch.active {
+  border-color: var(--accent);
+}
+
+.ctx-custom {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 8px 0 2px;
+}
+
+.ctx-custom input[type='color'] {
+  width: 36px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  background: none;
+}
+
+.ctx-custom button {
+  flex: 1;
+}
+
+.chat-panel {
+  position: relative;
+}
+
+.chat-panel.dropping::after {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border: 2px dashed var(--accent);
+  border-radius: 10px;
+  background: rgba(243, 146, 0, 0.08);
+  pointer-events: none;
+  z-index: 20;
+}
+
+.chat-drop-hint {
+  position: absolute;
+  left: 50%;
+  top: 45%;
+  transform: translate(-50%, -50%);
+  z-index: 21;
+  padding: 10px 18px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.attachment-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 6px 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  font-size: 12px;
+}
+
+.attachment-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+
+.attachment-file small {
+  color: var(--muted);
+}
+
+.attachment-file button {
+  padding: 0 4px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
 }

@@ -2,7 +2,7 @@ import { app, safeStorage } from 'electron'
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
-import type { Settings } from '@shared/types'
+import type { CliAgent, Settings } from '@shared/types'
 
 const OPENSCAD_CANDIDATES = [
   'C:\\Program Files\\OpenSCAD (Nightly)\\openscad.com',
@@ -29,12 +29,34 @@ export function detectClaude(): string {
   return candidates.find((candidate) => existsSync(candidate)) ?? 'claude'
 }
 
+const AGENT_CANDIDATES: Record<CliAgent, string[]> = {
+  codex: [
+    join(homedir(), 'AppData', 'Local', 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe'),
+    join(homedir(), 'AppData', 'Roaming', 'npm', 'codex.cmd'),
+    join(homedir(), '.local', 'bin', 'codex'),
+    '/usr/local/bin/codex',
+    '/opt/homebrew/bin/codex'
+  ],
+  grok: [join(homedir(), '.grok', 'bin', 'grok.exe'), join(homedir(), '.grok', 'bin', 'grok'), '/usr/local/bin/grok', '/opt/homebrew/bin/grok'],
+  agy: [join(homedir(), 'AppData', 'Local', 'agy', 'bin', 'agy.exe'), join(homedir(), '.local', 'bin', 'agy'), '/usr/local/bin/agy', '/opt/homebrew/bin/agy']
+}
+
+export function detectAgent(agent: CliAgent): string {
+  return AGENT_CANDIDATES[agent].find((candidate) => existsSync(candidate)) ?? agent
+}
+
 const DEFAULTS: Settings = {
   openscadPath: '',
   claudePath: '',
   claudeModel: '',
   claudeEffort: '',
   claudeAllowBash: false,
+  codexPath: '',
+  codexModel: '',
+  grokPath: '',
+  grokModel: '',
+  agyPath: '',
+  agyModel: '',
   openrouterApiKey: '',
   openrouterModel: 'anthropic/claude-sonnet-5.5',
   aiProvider: 'auto' as Settings['aiProvider'],
@@ -45,6 +67,8 @@ const DEFAULTS: Settings = {
   uiMode: 'simple',
   bedX: 270,
   bedY: 270,
+  bedZ: 270,
+  printerName: '',
   recentProjects: []
 }
 
@@ -70,6 +94,9 @@ export function loadSettings(): Settings {
   }
   if (!settings.openscadPath) settings.openscadPath = detectOpenscad()
   if (!settings.claudePath) settings.claudePath = detectClaude()
+  if (!settings.codexPath) settings.codexPath = detectAgent('codex')
+  if (!settings.grokPath) settings.grokPath = detectAgent('grok')
+  if (!settings.agyPath) settings.agyPath = detectAgent('agy')
   if ((settings.aiProvider as string) === 'auto') {
     settings.aiProvider = !settings.openrouterApiKey && existsSync(settings.claudePath) ? 'claude-code' : 'openrouter'
   }
